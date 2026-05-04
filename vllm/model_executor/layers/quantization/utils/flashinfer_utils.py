@@ -244,9 +244,19 @@ def align_fp4_moe_weights_for_fi(
     up_mult = 2 if is_act_and_mul else 1
     padded_gate_up_dim = up_mult * padded_intermediate
 
-    # Pad w13 and w2 along its intermediate dimension.
+    # Pad w13 and w2 along the intermediate dimension. Gated weights are
+    # stored as two concatenated halves, so each half needs its own padding.
     padded_w13 = w13.new_zeros((num_experts, padded_gate_up_dim, hidden_size // 2))
-    padded_w13[:, : w13.shape[1], :] = w13
+    if is_act_and_mul:
+        intermediate_half = w13.shape[1] // 2
+        padded_w13[:, :intermediate_half, :] = w13[:, :intermediate_half, :]
+        padded_w13[
+            :,
+            padded_intermediate : padded_intermediate + intermediate_half,
+            :,
+        ] = w13[:, intermediate_half:, :]
+    else:
+        padded_w13[:, : w13.shape[1], :] = w13
 
     padded_w2 = w2.new_zeros((num_experts, hidden_size, padded_intermediate // 2))
     padded_w2[:, :, : w2.shape[2]] = w2
@@ -254,7 +264,16 @@ def align_fp4_moe_weights_for_fi(
     padded_w13_scale = w13_scale.new_zeros(
         (num_experts, padded_gate_up_dim, hidden_size // 16)
     )
-    padded_w13_scale[:, : w13_scale.shape[1], :] = w13_scale
+    if is_act_and_mul:
+        intermediate_half = w13_scale.shape[1] // 2
+        padded_w13_scale[:, :intermediate_half, :] = w13_scale[:, :intermediate_half, :]
+        padded_w13_scale[
+            :,
+            padded_intermediate : padded_intermediate + intermediate_half,
+            :,
+        ] = w13_scale[:, intermediate_half:, :]
+    else:
+        padded_w13_scale[:, : w13_scale.shape[1], :] = w13_scale
 
     padded_w2_scale = w2_scale.new_zeros(
         (num_experts, hidden_size, padded_intermediate // 16)

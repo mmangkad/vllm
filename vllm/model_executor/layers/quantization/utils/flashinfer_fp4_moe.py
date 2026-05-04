@@ -284,6 +284,93 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     )
 
 
+def _pad_trtllm_gemm1_bias(
+    gemm1_bias: torch.Tensor,
+    intermediate_size: int,
+    is_gated_activation: bool,
+) -> torch.Tensor:
+    gemm1_rows = 2 * intermediate_size if is_gated_activation else intermediate_size
+    if gemm1_bias.shape[1] == gemm1_rows:
+        return gemm1_bias
+
+    padded_bias = gemm1_bias.new_zeros((gemm1_bias.shape[0], gemm1_rows))
+    if is_gated_activation:
+        bias_intermediate = gemm1_bias.shape[1] // 2
+        padded_bias[:, :bias_intermediate] = gemm1_bias[:, :bias_intermediate]
+        padded_bias[
+            :,
+            intermediate_size : intermediate_size + bias_intermediate,
+        ] = gemm1_bias[:, bias_intermediate:]
+    else:
+        padded_bias[:, : gemm1_bias.shape[1]] = gemm1_bias
+
+    return padded_bias
+
+
+def _pad_trtllm_gemm2_bias(
+    gemm2_bias: torch.Tensor,
+    hidden_size: int,
+) -> torch.Tensor:
+    if gemm2_bias.shape[1] == hidden_size:
+        return gemm2_bias
+
+    padded_bias = gemm2_bias.new_zeros((gemm2_bias.shape[0], hidden_size))
+    padded_bias[:, : gemm2_bias.shape[1]] = gemm2_bias
+    return padded_bias
+
+
+def prepare_trtllm_fp4_moe_biases(
+    gemm1_bias: torch.Tensor | None,
+    gemm2_bias: torch.Tensor | None,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    is_gated_activation: bool,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    epilogue_tile_m = 128
+    cache_permute_indices: dict[tuple[str, torch.Size], torch.Tensor] = {}
+
+    if gemm1_bias is not None:
+        gemm1_bias = _pad_trtllm_gemm1_bias(
+            gemm1_bias,
+            intermediate_size,
+            is_gated_activation,
+        )
+        gemm1_bias_shuffled = []
+        for i in range(num_experts):
+            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                cache_permute_indices,
+                gemm1_bias[i].reshape(-1, 1),
+                epilogue_tile_m,
+                is_gated_act_gemm=is_gated_activation,
+            )
+            gemm1_bias_shuffled.append(
+                gemm1_bias[i][permute_indices.to(gemm1_bias.device)].contiguous()
+            )
+        gemm1_bias = torch.stack(gemm1_bias_shuffled)
+
+    if gemm2_bias is not None:
+        gemm2_bias = _pad_trtllm_gemm2_bias(gemm2_bias, hidden_size)
+        gemm2_bias_shuffled = []
+        for i in range(num_experts):
+            permute_indices = get_w2_permute_indices_with_cache(
+                cache_permute_indices,
+                gemm2_bias[i].reshape(-1, 1),
+                epilogue_tile_m,
+            )
+            gemm2_bias_shuffled.append(
+                gemm2_bias[i][permute_indices.to(gemm2_bias.device)].contiguous()
+            )
+        gemm2_bias = torch.stack(gemm2_bias_shuffled)
+
+    return gemm1_bias, gemm2_bias
+
+
 def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
     backend: "NvFp4MoeBackend",
     layer: "FusedMoE",

@@ -59,6 +59,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    prepare_trtllm_fp4_moe_biases,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
 )
@@ -1489,6 +1492,23 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
         replace_parameter(layer, "w2_input_scale", a2_scale)
+
+        if self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+            w13_bias, w2_bias = prepare_trtllm_fp4_moe_biases(
+                gemm1_bias=getattr(layer, "w13_bias", None),
+                gemm2_bias=getattr(layer, "w2_bias", None),
+                hidden_size=w2.size(1),
+                intermediate_size=w13.size(1) // 2
+                if self.moe.is_act_and_mul
+                else w13.size(1),
+                num_experts=w13.size(0),
+                is_gated_activation=layer.activation.is_gated
+                and self.moe.is_act_and_mul,
+            )
+            if w13_bias is not None:
+                replace_parameter(layer, "w13_bias", w13_bias)
+            if w2_bias is not None:
+                replace_parameter(layer, "w2_bias", w2_bias)
 
         # Setup modular kernel.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
