@@ -1426,10 +1426,20 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 NvFp4MoeBackend.FLASHINFER_TRTLLM,
             ):
                 w13_bias = self._swap_gate_up_halves(w13_bias, dim=1)
-            replace_parameter(layer, "w13_bias", w13_bias.to(torch.float32))
+            bias_dtype = (
+                layer.params_dtype
+                if self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS
+                else torch.float32
+            )
+            replace_parameter(layer, "w13_bias", w13_bias.to(bias_dtype))
 
         if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
-            replace_parameter(layer, "w2_bias", layer.w2_bias.to(torch.float32))
+            bias_dtype = (
+                layer.params_dtype
+                if self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS
+                else torch.float32
+            )
+            replace_parameter(layer, "w2_bias", layer.w2_bias.to(bias_dtype))
 
     def process_weights_after_loading(self, layer: FusedMoE) -> None:
         """
@@ -1503,6 +1513,9 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             w13_bias=getattr(layer, "w13_bias", None),
             w2_bias=getattr(layer, "w2_bias", None),
+            gemm1_alpha=1.702 if layer.activation == MoEActivation.SWIGLUOAI else None,
+            gemm1_beta=1.0 if layer.activation == MoEActivation.SWIGLUOAI else None,
+            swiglu_limit=7.0 if layer.activation == MoEActivation.SWIGLUOAI else None,
         )
 
     @property

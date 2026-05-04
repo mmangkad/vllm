@@ -98,18 +98,49 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             get_current_vllm_config().compilation_config.max_cudagraph_capture_size
         )
 
+        self.gemm1_alpha = None
+        self.gemm1_beta = None
+        self.gemm1_clamp_limit = None
+        if quant_config.gemm1_alpha is not None:
+            self.gemm1_alpha = torch.tensor(
+                [quant_config.gemm1_alpha] * self.num_experts,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if quant_config.gemm1_beta is not None:
+            self.gemm1_beta = torch.tensor(
+                [quant_config.gemm1_beta] * self.num_experts,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if quant_config.gemm1_clamp_limit is not None:
+            self.gemm1_clamp_limit = torch.tensor(
+                [quant_config.gemm1_clamp_limit] * self.num_experts,
+                dtype=torch.float32,
+                device=self.device,
+            )
+
         if quant_config.weight_quant_dtype == "mxfp4":
             # This value is used specifically for gpt-oss,
             # Need to revisit this for other models
-            self.gemm1_alpha = torch.tensor(
-                [1.702] * self.num_experts, dtype=torch.float32, device=self.device
-            )
-            self.gemm1_beta = torch.tensor(
-                [1.0] * self.num_experts, dtype=torch.float32, device=self.device
-            )
-            self.gemm1_clamp_limit = torch.tensor(
-                [7.0] * self.num_experts, dtype=torch.float32, device=self.device
-            )
+            if self.gemm1_alpha is None:
+                self.gemm1_alpha = torch.tensor(
+                    [1.702] * self.num_experts,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            if self.gemm1_beta is None:
+                self.gemm1_beta = torch.tensor(
+                    [1.0] * self.num_experts,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            if self.gemm1_clamp_limit is None:
+                self.gemm1_clamp_limit = torch.tensor(
+                    [7.0] * self.num_experts,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
             if quant_config.quant_dtype == "mxfp8":
                 self.fake_input_scale = torch.ones(
                     self.num_experts,
@@ -316,6 +347,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             fc2_expert_weights = w2.view(torch.long)
             fc1_expert_biases = self.w1_bias
             fc2_expert_biases = self.w2_bias
+            swiglu_alpha = self.gemm1_alpha
+            swiglu_beta = self.gemm1_beta
+            swiglu_limit = self.gemm1_clamp_limit
         elif self.weight_quant_dtype == "mxfp4":
             assert self.w1_scale is not None and self.w2_scale is not None
             assert w1.is_contiguous() and w2.is_contiguous()

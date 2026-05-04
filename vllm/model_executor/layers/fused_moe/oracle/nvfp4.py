@@ -431,6 +431,9 @@ def make_nvfp4_moe_quant_config(
     a2_scale: torch.Tensor,
     w13_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    swiglu_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     if backend == NvFp4MoeBackend.MARLIN:
         return nvfp4_w4a16_moe_quant_config(
@@ -440,6 +443,9 @@ def make_nvfp4_moe_quant_config(
             w2_scale=w2_scale,
             w1_bias=w13_bias,
             w2_bias=w2_bias,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=swiglu_limit,
         )
     elif backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(
@@ -451,6 +457,9 @@ def make_nvfp4_moe_quant_config(
             w2_scale=w2_scale,
             w1_bias=w13_bias,
             w2_bias=w2_bias,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=swiglu_limit,
         )
 
     # Pass w13_scale_2 / w2_scale_2 directly as g1/g2_alphas.
@@ -466,6 +475,9 @@ def make_nvfp4_moe_quant_config(
         w2_scale=w2_scale,
         w1_bias=w13_bias,
         w2_bias=w2_bias,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=swiglu_limit,
         # NOTE(rob): this is a hack until the MoE kernels
         # create their own quant configs. TRTLLM kernel
         # does not accept swizzled input quant scales.

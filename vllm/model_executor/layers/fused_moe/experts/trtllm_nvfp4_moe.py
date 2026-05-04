@@ -56,6 +56,34 @@ class TrtLlmNvFp4ExpertsBase:
         self.local_num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
 
+        device = torch.accelerator.current_device_index()
+        if quant_config.gemm1_alpha is not None:
+            self.gemm1_alpha = torch.tensor(
+                [quant_config.gemm1_alpha] * self.local_num_experts,
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            self.gemm1_alpha = None
+
+        if quant_config.gemm1_beta is not None:
+            self.gemm1_beta = torch.tensor(
+                [quant_config.gemm1_beta] * self.local_num_experts,
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            self.gemm1_beta = None
+
+        if quant_config.gemm1_clamp_limit is not None:
+            self.gemm1_clamp_limit = torch.tensor(
+                [quant_config.gemm1_clamp_limit] * self.local_num_experts,
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            self.gemm1_clamp_limit = None
+
         assert self.quant_config.g1_alphas is not None
         assert self.quant_config.a2_gscale is not None
         if moe_config.is_act_and_mul:
@@ -112,9 +140,10 @@ class TrtLlmNvFp4ExpertsBase:
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        """Supports only SiLU, RELU^2 non-gated and GELU activation."""
+        """Supports gated SiLU/GELU/SwiGLU-OAI and non-gated RELU^2."""
         return activation in [
             MoEActivation.SILU,
+            MoEActivation.SWIGLUOAI,
             MoEActivation.RELU2_NO_MUL,
             MoEActivation.GELU,
         ]
@@ -213,9 +242,9 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
             gemm1_bias=self.quant_config.w1_bias,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_beta=self.gemm1_beta,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
             gemm2_bias=self.quant_config.w2_bias,
@@ -326,9 +355,9 @@ class TrtLlmNvFp4ExpertsMonolithic(
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
             gemm1_bias=self.quant_config.w1_bias,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_beta=self.gemm1_beta,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
             gemm2_bias=self.quant_config.w2_bias,
