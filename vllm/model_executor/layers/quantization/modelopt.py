@@ -40,6 +40,8 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    FLASHINFER_NVFP4_MOE_BACKENDS,
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
@@ -1364,10 +1366,77 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+        if self.moe.has_bias:
+            w13_bias = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    w13_num_shards * intermediate_size_per_partition,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+
+            w2_bias = torch.nn.Parameter(
+                torch.zeros(num_experts, hidden_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+
+    @staticmethod
+    def _deinterleave_gpt_oss_gate_up(
+        tensor: torch.Tensor,
+        dim: int,
+    ) -> torch.Tensor:
+        dim = dim % tensor.dim()
+        if tensor.shape[dim] % 2 != 0:
+            raise ValueError(
+                "GPT-OSS gate/up tensor must have an even interleaved "
+                f"dimension, got shape {tuple(tensor.shape)}."
+            )
+        gate_idx = torch.arange(0, tensor.shape[dim], 2, device=tensor.device)
+        up_idx = torch.arange(1, tensor.shape[dim], 2, device=tensor.device)
+        gate = tensor.index_select(dim, gate_idx)
+        up = tensor.index_select(dim, up_idx)
+        return torch.cat([gate, up], dim=dim).contiguous()
+
+    @staticmethod
+    def _swap_gate_up_halves(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+        dim = dim % tensor.dim()
+        first, second = torch.chunk(tensor, 2, dim=dim)
+        return torch.cat([second, first], dim=dim).contiguous()
+
+    def _prepare_gpt_oss_nvfp4_layout(self, layer: FusedMoE) -> None:
+        if not getattr(layer, "is_gpt_oss_nvfp4_weight_layout", False):
+            return
+        if not self.moe.is_act_and_mul:
+            return
+        if self.nvfp4_backend not in FLASHINFER_NVFP4_MOE_BACKENDS:
+            return
+
+        w13 = self._deinterleave_gpt_oss_gate_up(layer.w13_weight, dim=1)
+        w13_scale = self._deinterleave_gpt_oss_gate_up(layer.w13_weight_scale, dim=1)
+        replace_parameter(layer, "w13_weight", w13)
+        replace_parameter(layer, "w13_weight_scale", w13_scale)
+
+        if hasattr(layer, "w13_bias") and layer.w13_bias is not None:
+            w13_bias = self._deinterleave_gpt_oss_gate_up(layer.w13_bias, dim=1)
+            if self.nvfp4_backend in (
+                NvFp4MoeBackend.FLASHINFER_CUTLASS,
+                NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            ):
+                w13_bias = self._swap_gate_up_halves(w13_bias, dim=1)
+            replace_parameter(layer, "w13_bias", w13_bias.to(torch.float32))
+
+        if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
+            replace_parameter(layer, "w2_bias", layer.w2_bias.to(torch.float32))
+
     def process_weights_after_loading(self, layer: FusedMoE) -> None:
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
+
+        self._prepare_gpt_oss_nvfp4_layout(layer)
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(
@@ -1432,6 +1501,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w2_scale_2=layer.w2_weight_scale_2,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+            w13_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
         )
 
     @property

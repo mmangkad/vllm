@@ -68,6 +68,132 @@ from .utils import (
 )
 
 
+def _copy_loaded_weight_to_param(
+    param_data: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    weight_name: str,
+) -> None:
+    if param_data.shape == loaded_weight.shape:
+        param_data.copy_(loaded_weight)
+        return
+
+    if param_data.dim() != loaded_weight.dim() or any(
+        loaded_dim > param_dim
+        for loaded_dim, param_dim in zip(loaded_weight.shape, param_data.shape)
+    ):
+        raise ValueError(
+            f"Cannot load {weight_name} with shape {tuple(loaded_weight.shape)} "
+            f"into parameter shape {tuple(param_data.shape)}."
+        )
+
+    param_data.zero_()
+    slices = tuple(slice(0, dim) for dim in loaded_weight.shape)
+    param_data[slices].copy_(loaded_weight)
+
+
+def _transpose_if_needed(
+    loaded_weight: torch.Tensor,
+    first_dim: int,
+    second_dim: int,
+    weight_name: str,
+) -> torch.Tensor:
+    if loaded_weight.shape[-2:] == (first_dim, second_dim):
+        return loaded_weight.contiguous()
+    if loaded_weight.shape[-2:] == (second_dim, first_dim):
+        return loaded_weight.transpose(-1, -2).contiguous()
+    raise ValueError(
+        f"Unsupported {weight_name} shape {tuple(loaded_weight.shape)}. "
+        f"Expected trailing dimensions {(first_dim, second_dim)} or "
+        f"{(second_dim, first_dim)}."
+    )
+
+
+def _reshape_gpt_oss_nvfp4_weight(
+    loaded_weight: torch.Tensor,
+    *,
+    weight_name: str,
+    is_w13: bool,
+    is_scale: bool,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    group_size: int,
+    expert_id: int | None,
+) -> torch.Tensor:
+    if is_w13:
+        first_dim = 2 * intermediate_size
+        second_dim = hidden_size // (group_size if is_scale else 2)
+    else:
+        first_dim = hidden_size
+        second_dim = intermediate_size // (group_size if is_scale else 2)
+
+    if expert_id is None:
+        if loaded_weight.dim() != 3:
+            raise ValueError(
+                f"Expected fused {weight_name} to be rank 3, got shape "
+                f"{tuple(loaded_weight.shape)}."
+            )
+        if loaded_weight.shape[0] != num_experts:
+            raise ValueError(
+                f"Expected {weight_name} first dimension to be {num_experts}, "
+                f"got {loaded_weight.shape[0]}."
+            )
+        return _transpose_if_needed(loaded_weight, first_dim, second_dim, weight_name)
+
+    if loaded_weight.dim() != 2:
+        raise ValueError(
+            f"Expected per-expert {weight_name} to be rank 2, got shape "
+            f"{tuple(loaded_weight.shape)}."
+        )
+    return _transpose_if_needed(loaded_weight, first_dim, second_dim, weight_name)
+
+
+def _expand_gpt_oss_nvfp4_scale(
+    loaded_weight: torch.Tensor,
+    target_shape: torch.Size,
+    weight_name: str,
+) -> torch.Tensor:
+    loaded_weight = loaded_weight.to(torch.float32)
+
+    if loaded_weight.shape == target_shape:
+        return loaded_weight.contiguous()
+    if loaded_weight.numel() == 1:
+        return loaded_weight.reshape(1).expand(target_shape).contiguous()
+
+    target_ndim = len(target_shape)
+    if target_ndim == 0:
+        if loaded_weight.numel() != 1:
+            raise ValueError(
+                f"Expected scalar {weight_name}, got shape "
+                f"{tuple(loaded_weight.shape)}."
+            )
+        return loaded_weight.reshape(())
+
+    if target_ndim == 1:
+        if loaded_weight.dim() == 2 and loaded_weight.shape[1] == 1:
+            loaded_weight = loaded_weight.squeeze(1)
+        if loaded_weight.shape == target_shape:
+            return loaded_weight.contiguous()
+
+    if target_ndim == 2:
+        if loaded_weight.dim() == 1:
+            if loaded_weight.shape[0] == target_shape[0]:
+                return loaded_weight[:, None].expand(target_shape).contiguous()
+            if loaded_weight.shape[0] == target_shape[1]:
+                return loaded_weight[None, :].expand(target_shape).contiguous()
+        if (
+            loaded_weight.dim() == 2
+            and loaded_weight.shape[0] == 1
+            and loaded_weight.shape[1] == target_shape[1]
+        ):
+            return loaded_weight.expand(target_shape).contiguous()
+
+    raise ValueError(
+        f"Cannot reshape {weight_name} with shape {tuple(loaded_weight.shape)} "
+        f"to {tuple(target_shape)}."
+    )
+
+
 class OAIAttention(nn.Module):
     def __init__(
         self,
@@ -570,6 +696,9 @@ class GptOssModel(nn.Module, EagleModelMixin):
             """
             return weight_dtype is not None and "mxfp4" in weight_dtype
 
+        def _is_nvfp4(weight_dtype: str | None) -> bool:
+            return weight_dtype == "nvfp4"
+
         def _get_moe_weight_dtype(layer_id: int = 0) -> str | None:
             """Helper function to get MoE quantization weight dtype.
 
@@ -580,11 +709,16 @@ class GptOssModel(nn.Module, EagleModelMixin):
             Returns:
                 Weight dtype string (e.g., "mxfp4", "fp8") or None if not available
             """
-            if hasattr(self.layers[layer_id].mlp.experts.quant_method, "weight_dtype"):
-                return self.layers[layer_id].mlp.experts.quant_method.weight_dtype
+            quant_method = self.layers[layer_id].mlp.experts.quant_method
+            if hasattr(quant_method, "weight_dtype"):
+                return quant_method.weight_dtype
+            if quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoE":
+                return "nvfp4"
             return None
 
         intermediate_size = self.config.intermediate_size
+        hidden_size = self.config.hidden_size
+        nvfp4_group_size = int(getattr(self.quant_config, "group_size", 16))
 
         moe_weight_dtype = _get_moe_weight_dtype(layer_id=0)
 
@@ -684,10 +818,116 @@ class GptOssModel(nn.Module, EagleModelMixin):
             if (
                 all(key in name for key in ["input_scale", "mlp.experts"])
                 and expert_id is not None
+                and not _is_nvfp4(moe_quant_method)
             ):
                 assert loaded_weight.numel() == 1
                 expert_data = params_dict[fused_name].data[expert_id]
                 expert_data.copy_(loaded_weight)
+                loaded_params.add(fused_name)
+                continue
+
+            elif _is_nvfp4(moe_quant_method) and any(
+                name.endswith(suffix)
+                for suffix in [
+                    ".w13_weight_scale_2",
+                    ".w2_weight_scale_2",
+                    ".w13_input_scale",
+                    ".w2_input_scale",
+                    ".w13_weight_scale",
+                    ".w2_weight_scale",
+                    ".w13_weight",
+                    ".w2_weight",
+                ]
+            ):
+                assert fused_name is not None
+                if fused_name not in params_dict:
+                    continue
+
+                if layer_id is not None:
+                    experts = self.layers[layer_id].mlp.experts
+                    experts.is_gpt_oss_nvfp4_weight_layout = True
+
+                param = params_dict[fused_name]
+                param_data = param.data if expert_id is None else param.data[expert_id]
+
+                is_w13 = ".w13_" in name
+                is_block_scale = name.endswith(
+                    (".w13_weight_scale", ".w2_weight_scale")
+                )
+                is_weight = name.endswith((".w13_weight", ".w2_weight"))
+
+                if is_weight or is_block_scale:
+                    loaded_weight = _reshape_gpt_oss_nvfp4_weight(
+                        loaded_weight,
+                        weight_name=name,
+                        is_w13=is_w13,
+                        is_scale=is_block_scale,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        num_experts=num_experts,
+                        group_size=nvfp4_group_size,
+                        expert_id=expert_id,
+                    )
+
+                    if use_ep and expert_id is None:
+                        loaded_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                    elif not use_ep:
+                        if is_w13:
+                            if expert_id is None:
+                                loaded_weight = loaded_weight[
+                                    :, 2 * tp_rank_start : 2 * tp_rank_end, ...
+                                ]
+                            else:
+                                loaded_weight = loaded_weight[
+                                    2 * tp_rank_start : 2 * tp_rank_end, ...
+                                ]
+                        else:
+                            divisor = nvfp4_group_size if is_block_scale else 2
+                            loaded_weight = loaded_weight[
+                                ...,
+                                tp_rank_start // divisor : tp_rank_end // divisor,
+                            ]
+                else:
+                    target_shape = param_data.shape
+                    if (
+                        use_ep
+                        and expert_id is None
+                        and loaded_weight.dim() > 0
+                        and loaded_weight.shape[0] == num_experts
+                        and param_data.dim() > 0
+                        and param_data.shape[0] != num_experts
+                    ):
+                        target_shape = torch.Size(
+                            (num_experts, *tuple(param_data.shape[1:]))
+                        )
+
+                    loaded_weight = _expand_gpt_oss_nvfp4_scale(
+                        loaded_weight,
+                        target_shape,
+                        name,
+                    )
+                    if (
+                        use_ep
+                        and expert_id is None
+                        and loaded_weight.dim() > 0
+                        and param_data.dim() > 0
+                        and loaded_weight.shape[0] != param_data.shape[0]
+                    ):
+                        if (
+                            loaded_weight.shape[0] >= ep_rank_end
+                            and param_data.shape[0] == ep_rank_end - ep_rank_start
+                        ):
+                            loaded_weight = loaded_weight[
+                                ep_rank_start:ep_rank_end, ...
+                            ]
+                        else:
+                            raise ValueError(
+                                f"Cannot load {name} with expert dimension "
+                                f"{loaded_weight.shape[0]} into parameter shape "
+                                f"{tuple(param_data.shape)}."
+                            )
+
+                _copy_loaded_weight_to_param(param_data, loaded_weight, fused_name)
                 loaded_params.add(fused_name)
                 continue
 
@@ -897,10 +1137,18 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # weight loaders without added complexity, so just do the
                 # direct load here.
                 assert fused_name is not None
+                if fused_name not in params_dict:
+                    continue
+                if layer_id is not None and _is_nvfp4(moe_quant_method):
+                    experts = self.layers[layer_id].mlp.experts
+                    experts.is_gpt_oss_nvfp4_weight_layout = True
                 param = params_dict[fused_name]
-                expert_data = param.data[expert_id]
-                dim1 = sliced_weight.shape[0]
-                expert_data.data[:dim1].copy_(sliced_weight)
+                if expert_id is None:
+                    _copy_loaded_weight_to_param(param.data, sliced_weight, fused_name)
+                else:
+                    _copy_loaded_weight_to_param(
+                        param.data[expert_id], sliced_weight, fused_name
+                    )
                 loaded_params.add(fused_name)
                 continue
 
@@ -1141,6 +1389,10 @@ class GptOssModel(nn.Module, EagleModelMixin):
         if quant_method == "mxfp4":
             quant_method = "gpt_oss_mxfp4"
 
+        quant_config_name = (
+            self.quant_config.get_name() if self.quant_config is not None else None
+        )
+
         if quant_method == "gpt_oss_mxfp4":
             return self._load_weights_mxfp4(
                 ep_rank_end,
@@ -1150,7 +1402,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 weights,
                 stacked_params_mapping,
             )
-        elif quant_method == "quark":
+        elif quant_method == "quark" or quant_config_name == "modelopt_fp4":
             return self._load_weights_quark(
                 ep_rank_end,
                 ep_rank_start,
@@ -1193,13 +1445,22 @@ class GptOssForCausalLM(
             # MoE Bias
             ".gate_up_proj_bias": ".w13_bias",
             ".down_proj_bias": ".w2_bias",
+            # MoE ModelOpt NVFP4 weights and scales
+            ".gate_up_proj_weight_scale": ".w13_weight_scale",
+            ".gate_up_proj_weight_scale_2": ".w13_weight_scale_2",
+            ".gate_up_proj_input_scale": ".w13_input_scale",
+            ".down_proj_weight_scale": ".w2_weight_scale",
+            ".down_proj_weight_scale_2": ".w2_weight_scale_2",
+            ".down_proj_input_scale": ".w2_input_scale",
             # For quark format
             ".gate_up_proj.weight": ".w13_weight",
             ".gate_up_proj.weight_scale": ".w13_weight_scale",
+            ".gate_up_proj.weight_scale_2": ".w13_weight_scale_2",
             ".gate_up_proj.bias": ".w13_bias",
             ".gate_up_proj.input_scale": ".w13_input_scale",
             ".down_proj.weight": ".w2_weight",
             ".down_proj.weight_scale": ".w2_weight_scale",
+            ".down_proj.weight_scale_2": ".w2_weight_scale_2",
             ".down_proj.bias": ".w2_bias",
             ".down_proj.input_scale": ".w2_input_scale",
         },
