@@ -94,6 +94,52 @@ class TrtLlmNvFp4ExpertsBase:
         else:
             self.g1_scale_c = self.quant_config.a2_gscale.clone()
 
+        self._scale_dependent_params_adjusted = False
+
+        from vllm.config import get_current_vllm_config
+
+        self.max_capture_size = (
+            get_current_vllm_config().compilation_config.max_cudagraph_capture_size
+        )
+
+    @staticmethod
+    def _expert_scale_view(scales: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        view_shape = (scales.shape[0],) + (1,) * (target.ndim - 1)
+        return scales.reshape(view_shape).to(device=target.device)
+
+    @classmethod
+    def _divide_by_expert_scale_(
+        cls,
+        target: torch.Tensor | None,
+        scales: torch.Tensor,
+    ) -> None:
+        if target is not None:
+            target.div_(cls._expert_scale_view(scales, target))
+
+    def _adjust_scale_dependent_params(self) -> None:
+        if self._scale_dependent_params_adjusted:
+            return
+
+        assert self.quant_config.g1_alphas is not None
+        assert self.quant_config.g2_alphas is not None
+
+        with torch.no_grad():
+            self._divide_by_expert_scale_(
+                self.quant_config.w1_bias,
+                self.quant_config.g1_alphas,
+            )
+            self._divide_by_expert_scale_(
+                self.quant_config.w2_bias,
+                self.quant_config.g2_alphas,
+            )
+            self._divide_by_expert_scale_(self.gemm1_beta, self.quant_config.g1_alphas)
+            self._divide_by_expert_scale_(
+                self.gemm1_clamp_limit,
+                self.quant_config.g1_alphas,
+            )
+
+        self._scale_dependent_params_adjusted = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
         layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
@@ -111,6 +157,7 @@ class TrtLlmNvFp4ExpertsBase:
             torch.nn.Parameter(g1_scale_c, requires_grad=False),
         )
         self.g1_scale_c = layer.g1_scale_c
+        self._adjust_scale_dependent_params()
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -231,39 +278,47 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         # Pack topk ids and weights into format expected by the kernel.
         packed_tensor = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
 
+        from vllm.utils.flashinfer import _is_fi_autotuning, autotune
+
         # Invoke kernel.
-        flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
-            topk_ids=packed_tensor,
-            routing_bias=None,
-            hidden_states=hidden_states,
-            hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
-                *hidden_states.shape[:-1], -1
-            ),
-            gemm1_weights=w1,
-            gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=self.quant_config.w1_bias,
-            gemm1_alpha=self.gemm1_alpha,
-            gemm1_beta=self.gemm1_beta,
-            gemm1_clamp_limit=self.gemm1_clamp_limit,
-            gemm2_weights=w2,
-            gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=self.quant_config.w2_bias,
-            output1_scale_scalar=self.g1_scale_c,
-            output1_scale_gate_scalar=self.quant_config.g1_alphas,
-            output2_scale_scalar=self.quant_config.g2_alphas,
-            num_experts=global_num_experts,
-            top_k=self.topk,
-            n_group=0,
-            topk_group=0,
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.ep_rank * self.local_num_experts,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,  # not used
-            do_finalize=True,
-            activation_type=activation_to_flashinfer_int(activation),
-            output=output,
-        )
+        with autotune(_is_fi_autotuning):
+            flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
+                topk_ids=packed_tensor,
+                routing_bias=None,
+                hidden_states=hidden_states,
+                hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
+                    *hidden_states.shape[:-1], -1
+                ),
+                gemm1_weights=w1,
+                gemm1_weights_scale=self.quant_config.w1_scale.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm1_bias=self.quant_config.w1_bias,
+                gemm1_alpha=self.gemm1_alpha,
+                gemm1_beta=self.gemm1_beta,
+                gemm1_clamp_limit=self.gemm1_clamp_limit,
+                gemm2_weights=w2,
+                gemm2_weights_scale=self.quant_config.w2_scale.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm2_bias=self.quant_config.w2_bias,
+                output1_scale_scalar=self.g1_scale_c,
+                output1_scale_gate_scalar=self.quant_config.g1_alphas,
+                output2_scale_scalar=self.quant_config.g2_alphas,
+                num_experts=global_num_experts,
+                top_k=self.topk,
+                n_group=0,
+                topk_group=0,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=1,  # not used
+                do_finalize=True,
+                activation_type=activation_to_flashinfer_int(activation),
+                output=output,
+                tune_max_num_tokens=max(self.max_capture_size, 1),
+            )
 
 
 class TrtLlmNvFp4ExpertsMonolithic(
@@ -342,37 +397,55 @@ class TrtLlmNvFp4ExpertsMonolithic(
         if e_score_correction_bias is not None:
             e_score_correction_bias = e_score_correction_bias.to(torch.bfloat16)
 
+        output = torch.empty(
+            *hidden_states.shape[:-1],
+            self.hidden_dim,
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+
+        from vllm.utils.flashinfer import _is_fi_autotuning, autotune
+
         # Invoke kernel.
         # NOTE: Activation padding and output
-        # truncation are handled by the MoE runner's
-        return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits,
-            routing_bias=e_score_correction_bias,
-            hidden_states=hidden_states,
-            hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
-                *hidden_states.shape[:-1], -1
-            ),
-            gemm1_weights=w1,
-            gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=self.quant_config.w1_bias,
-            gemm1_alpha=self.gemm1_alpha,
-            gemm1_beta=self.gemm1_beta,
-            gemm1_clamp_limit=self.gemm1_clamp_limit,
-            gemm2_weights=w2,
-            gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=self.quant_config.w2_bias,
-            output1_scale_scalar=self.g1_scale_c,
-            output1_scale_gate_scalar=self.quant_config.g1_alphas,
-            output2_scale_scalar=self.quant_config.g2_alphas,
-            num_experts=global_num_experts,
-            top_k=self.topk,
-            n_group=(num_expert_group or 0),
-            topk_group=(topk_group or 0),
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.ep_rank * self.local_num_experts,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=self.routing_method_type,
-            do_finalize=True,
-            activation_type=activation_to_flashinfer_int(activation),
-        )[0]
+        # truncation are handled by the MoE runner.
+        with autotune(_is_fi_autotuning):
+            flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+                routing_logits=router_logits.to(torch.bfloat16),
+                routing_bias=e_score_correction_bias,
+                hidden_states=hidden_states,
+                hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
+                    *hidden_states.shape[:-1], -1
+                ),
+                gemm1_weights=w1,
+                gemm1_weights_scale=self.quant_config.w1_scale.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm1_bias=self.quant_config.w1_bias,
+                gemm1_alpha=self.gemm1_alpha,
+                gemm1_beta=self.gemm1_beta,
+                gemm1_clamp_limit=self.gemm1_clamp_limit,
+                gemm2_weights=w2,
+                gemm2_weights_scale=self.quant_config.w2_scale.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm2_bias=self.quant_config.w2_bias,
+                output1_scale_scalar=self.g1_scale_c,
+                output1_scale_gate_scalar=self.quant_config.g1_alphas,
+                output2_scale_scalar=self.quant_config.g2_alphas,
+                num_experts=global_num_experts,
+                top_k=self.topk,
+                n_group=(num_expert_group or 0),
+                topk_group=(topk_group or 0),
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=self.routing_method_type,
+                do_finalize=True,
+                activation_type=activation_to_flashinfer_int(activation),
+                output=output,
+                tune_max_num_tokens=max(self.max_capture_size, 1),
+            )
+
+        return output

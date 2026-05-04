@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+    TrtLlmNvFp4ExpertsBase,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     activation_to_flashinfer_int,
     align_trtllm_fp4_moe_hidden_dim_for_fi,
@@ -17,6 +22,36 @@ def test_flashinfer_activation_maps_swigluoai_to_swiglu():
     assert activation_to_flashinfer_int(MoEActivation.SWIGLUOAI) == (
         core.ActivationType.Swiglu.value
     )
+
+
+def test_trtllm_nvfp4_rescales_alpha_dependent_params_once():
+    w1_bias = torch.tensor([[2.0, 4.0], [8.0, 16.0]])
+    w2_bias = torch.tensor([[10.0, 20.0], [60.0, 80.0]])
+
+    experts = object.__new__(TrtLlmNvFp4ExpertsBase)
+    experts._scale_dependent_params_adjusted = False
+    experts.quant_config = SimpleNamespace(
+        g1_alphas=torch.tensor([2.0, 4.0]),
+        g2_alphas=torch.tensor([10.0, 20.0]),
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+    )
+    experts.gemm1_beta = torch.tensor([1.0, 1.0])
+    experts.gemm1_clamp_limit = torch.tensor([7.0, 7.0])
+
+    experts._adjust_scale_dependent_params()
+
+    torch.testing.assert_close(w1_bias, torch.tensor([[1.0, 2.0], [2.0, 4.0]]))
+    torch.testing.assert_close(w2_bias, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    torch.testing.assert_close(experts.gemm1_beta, torch.tensor([0.5, 0.25]))
+    torch.testing.assert_close(experts.gemm1_clamp_limit, torch.tensor([3.5, 1.75]))
+
+    experts._adjust_scale_dependent_params()
+
+    torch.testing.assert_close(w1_bias, torch.tensor([[1.0, 2.0], [2.0, 4.0]]))
+    torch.testing.assert_close(w2_bias, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    torch.testing.assert_close(experts.gemm1_beta, torch.tensor([0.5, 0.25]))
+    torch.testing.assert_close(experts.gemm1_clamp_limit, torch.tensor([3.5, 1.75]))
 
 
 def test_align_trtllm_fp4_moe_hidden_dim_noop():
