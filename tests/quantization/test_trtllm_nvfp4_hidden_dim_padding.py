@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    activation_to_flashinfer_int,
     align_trtllm_fp4_moe_hidden_dim_for_fi,
 )
+
+
+def test_flashinfer_activation_maps_swigluoai_to_swiglu():
+    core = pytest.importorskip("flashinfer.fused_moe.core")
+
+    assert activation_to_flashinfer_int(MoEActivation.SWIGLUOAI) == (
+        core.ActivationType.Swiglu.value
+    )
 
 
 def test_align_trtllm_fp4_moe_hidden_dim_noop():
