@@ -90,6 +90,7 @@ def test_models(example_prompts, model_name) -> None:
 EAGER = [True, False]
 
 SM_100_NVFP4_BACKENDS = [
+    "flashinfer-cutedsl",
     "flashinfer-cudnn",
     "flashinfer-trtllm",
     "flashinfer-cutlass",
@@ -102,12 +103,18 @@ SM_100_NVFP4_BACKENDS = [
     "backend",
     [
         "emulation",
+        "flashinfer-cutedsl",
         "flashinfer-cudnn",
         "flashinfer-trtllm",  # the small seq_len ensures trtllm_8x4_layout backend is used
         "flashinfer-cutlass",
     ],
 )
 def test_nvfp4(vllm_runner, model, eager, backend, monkeypatch):
+    if backend == "flashinfer-cutedsl" and not (
+        current_platform.is_device_capability_family(100)
+    ):
+        pytest.skip("The flashinfer-cutedsl backend is only supported on SM10x")
+
     if (
         not current_platform.has_device_capability(100)
         and backend in SM_100_NVFP4_BACKENDS

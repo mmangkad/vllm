@@ -102,6 +102,7 @@ from vllm.model_executor.kernels.linear.nvfp4.fbgemm import (
 )
 from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
     FlashInferCudnnNvFp4LinearKernel,
+    FlashInferCuteDslNvFp4LinearKernel,
     FlashInferCutlassNvFp4LinearKernel,
     FlashInferTrtllmNvFp4LinearKernel,
 )
@@ -276,6 +277,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
 
 _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        FlashInferCuteDslNvFp4LinearKernel,
         FlashInferCutlassNvFp4LinearKernel,
         CutlassNvFp4LinearKernel,
         MarlinNvFp4LinearKernel,
@@ -672,6 +674,7 @@ def init_wfp8_a16_linear_kernel(
 
 # Maps VLLM_NVFP4_GEMM_BACKEND env var values to kernel classes.
 _NVFP4_BACKEND_TO_KERNEL: dict[str, type[NvFp4LinearKernel]] = {
+    "flashinfer-cutedsl": FlashInferCuteDslNvFp4LinearKernel,
     "flashinfer-cutlass": FlashInferCutlassNvFp4LinearKernel,
     "cutlass": CutlassNvFp4LinearKernel,
     "marlin": MarlinNvFp4LinearKernel,
@@ -858,6 +861,7 @@ __all__ = [
     "CutlassNvFp4LinearKernel",
     "EmulationNvFp4LinearKernel",
     "FbgemmNvFp4LinearKernel",
+    "FlashInferCuteDslNvFp4LinearKernel",
     "FlashInferCutlassNvFp4LinearKernel",
     "FlashInferTrtllmNvFp4LinearKernel",
     "FlashInferCudnnNvFp4LinearKernel",
