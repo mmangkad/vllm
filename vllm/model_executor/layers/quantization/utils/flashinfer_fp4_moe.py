@@ -342,6 +342,9 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
 
     # Shuffle weights and scales for FI TRTLLM NVFP4 MoE kernels.
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+        a13_scale = torch.ones_like(a13_scale, dtype=torch.float32)
+        a2_scale = torch.ones_like(a2_scale, dtype=torch.float32)
+
         w13, w13_scale, w2, w2_scale, padded_hidden = (
             align_trtllm_fp4_moe_hidden_dim_for_fi(w13, w13_scale, w2, w2_scale)
         )

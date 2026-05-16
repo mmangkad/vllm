@@ -122,7 +122,17 @@ def _nvfp4_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
     is_sf_swizzled_layout: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    use_per_token_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    if use_per_token_scale:
+        from vllm.utils.flashinfer import flashinfer_quant_nvfp4_per_token
+
+        # FlashInfer's per-token NVFP4 activation path uses the inverse base
+        # scale multiplier and returns the dynamic per-token scale separately.
+        base_scale_inv = A.new_tensor(1.0 / (448.0 * 6.0), dtype=torch.float32)
+        A_q, A_sf, A_token_scale = flashinfer_quant_nvfp4_per_token(A, base_scale_inv)
+        return A_q, (A_sf, A_token_scale)
+
     return ops.scaled_fp4_quant(A, A_scale, is_sf_swizzled_layout=is_sf_swizzled_layout)
 
 
@@ -260,7 +270,8 @@ def moe_kernel_quantize_input(
     ocp_mx_scheme: str | None = None,
     quantization_emulation: bool = False,
     mx_alignment: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    use_nvfp4_per_token_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None]:
     # Handle OCP MX scheme that requires QDQ (quantize-dequantize) for emulation
     if ocp_mx_scheme is not None:
         if ocp_mx_scheme in {"w_mxfp4", "w_mxfp4_a_mxfp4"}:
@@ -296,7 +307,12 @@ def moe_kernel_quantize_input(
         return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == "nvfp4":
         if not quantization_emulation:
-            return _nvfp4_quantize(A, A_scale, is_sf_swizzled_layout=is_scale_swizzled)
+            return _nvfp4_quantize(
+                A,
+                A_scale,
+                is_sf_swizzled_layout=is_scale_swizzled,
+                use_per_token_scale=use_nvfp4_per_token_scale,
+            )
         else:
             A = ref_nvfp4_quant_dequant(A, A_scale, block_size=16)
             return A, None

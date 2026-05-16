@@ -31,6 +31,14 @@ from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 logger = init_logger(__name__)
 
 
+def _unpack_nvfp4_scales(
+    a1q_scale: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if isinstance(a1q_scale, tuple):
+        return a1q_scale
+    return a1q_scale, None
+
+
 class TrtLlmNvFp4ExpertsBase:
     """
     NvFp4 TRTLLM-Gen MoE kernels. Supports modular and monolithic interface.
@@ -198,6 +206,7 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         assert a1q_scale is not None
         assert self.quant_config.w1_scale is not None
         assert self.quant_config.w2_scale is not None
+        hidden_states_scale, per_token_scale = _unpack_nvfp4_scales(a1q_scale)
 
         # Pack topk ids and weights into format expected by the kernel.
         packed_tensor = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
@@ -207,7 +216,7 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             topk_ids=packed_tensor,
             routing_bias=None,
             hidden_states=hidden_states,
-            hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
+            hidden_states_scale=hidden_states_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
             ),
             gemm1_weights=w1,
@@ -233,6 +242,7 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             routing_method_type=1,  # not used
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
+            per_token_scale=per_token_scale,
             output=output,
         )
 
@@ -307,6 +317,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
             not apply_router_weight_on_input
             and self.routing_method_type != RoutingMethodType.Llama4
         )
+        hidden_states_scale, per_token_scale = _unpack_nvfp4_scales(a1q_scale)
 
         # Currently FI requires bfloat16 routing bias.
         # https://github.com/flashinfer-ai/flashinfer/issues/2909
@@ -320,7 +331,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
             hidden_states=hidden_states,
-            hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
+            hidden_states_scale=hidden_states_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
             ),
             gemm1_weights=w1,
@@ -346,4 +357,5 @@ class TrtLlmNvFp4ExpertsMonolithic(
             routing_method_type=self.routing_method_type,
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
+            per_token_scale=per_token_scale,
         )[0]

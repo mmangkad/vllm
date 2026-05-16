@@ -607,6 +607,37 @@ if has_flashinfer():
         )
 
     @torch.library.custom_op(
+        "vllm::flashinfer_nvfp4_quantize_per_token",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def flashinfer_nvfp4_quantize_per_token(
+        a: torch.Tensor, a_global_sf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from flashinfer import SfLayout
+        from flashinfer import nvfp4_quantize as nvfp4_quantize_
+
+        return nvfp4_quantize_(
+            a,
+            a_global_sf,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+        )
+
+    @torch.library.register_fake(
+        "vllm::flashinfer_nvfp4_quantize_per_token",
+    )
+    def flashinfer_nvfp4_quantize_per_token_fake(
+        a: torch.Tensor, a_global_sf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        m, n = a.shape
+        return (
+            torch.empty(m, n // 2, dtype=torch.uint8, device=a.device),
+            torch.empty(m, n // 16, dtype=torch.uint8, device=a.device),
+            torch.empty(m, dtype=torch.float32, device=a.device),
+        )
+
+    @torch.library.custom_op(
         "vllm::mm_mxfp8",
         mutates_args=[],
         device_types="cuda",
@@ -830,6 +861,12 @@ def flashinfer_quant_nvfp4_8x4_sf_layout(
     a: torch.Tensor, a_global_sf: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return flashinfer_nvfp4_quantize(a, a_global_sf)
+
+
+def flashinfer_quant_nvfp4_per_token(
+    a: torch.Tensor, a_global_sf: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return flashinfer_nvfp4_quantize_per_token(a, a_global_sf)
 
 
 flashinfer_fp8_blockscale_gemm = _lazy_import_wrapper(

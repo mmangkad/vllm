@@ -255,6 +255,7 @@ class FusedMoEQuantConfig:
     gemm1_clamp_limit: float | None = None
 
     mx_alignment: int = 0
+    use_nvfp4_per_token_scale: bool = False
 
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (
@@ -506,6 +507,7 @@ class FusedMoEQuantConfig:
         gemm1_alpha: float | None = None,
         gemm1_beta: float | None = None,
         gemm1_clamp_limit: float | None = None,
+        use_nvfp4_per_token_scale: bool = False,
     ) -> "FusedMoEQuantConfig":
         """
         General builder function for a FusedMoEQuantConfig.
@@ -541,6 +543,8 @@ class FusedMoEQuantConfig:
         - gemm1_alpha: Optional MXFP4 TRTLLM SwiGLU alpha parameter.
         - gemm1_beta: Optional MXFP4 TRTLLM SwiGLU beta parameter.
         - gemm1_clamp_limit: Optional MXFP4 TRTLLM SwiGLU clamp limit.
+        - use_nvfp4_per_token_scale: Whether NVFP4 activation quantization
+          should return per-token scales for kernels that consume them.
         """
         assert not isinstance(quant_dtype, str) or quant_dtype in {
             "nvfp4",
@@ -577,6 +581,7 @@ class FusedMoEQuantConfig:
             gemm1_alpha=gemm1_alpha,
             gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=gemm1_clamp_limit,
+            use_nvfp4_per_token_scale=use_nvfp4_per_token_scale,
         )
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.per_out_ch_quant == per_out_ch_quant
@@ -805,6 +810,7 @@ def nvfp4_moe_quant_config(
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     is_scale_swizzled: bool = True,
+    use_nvfp4_per_token_scale: bool = False,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for mxfp4 activations and nvp4 weights.
@@ -823,6 +829,7 @@ def nvfp4_moe_quant_config(
         per_out_ch_quant=False,
         block_shape=None,
         is_scale_swizzled=is_scale_swizzled,
+        use_nvfp4_per_token_scale=use_nvfp4_per_token_scale,
     )
 
 

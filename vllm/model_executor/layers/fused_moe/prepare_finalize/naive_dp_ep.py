@@ -41,13 +41,19 @@ def _quantize_and_setup_dispatch(
             block_shape=quant_config.block_shape,
             is_scale_swizzled=False,
             mx_alignment=quant_config.mx_alignment,
+            use_nvfp4_per_token_scale=quant_config.use_nvfp4_per_token_scale,
         )
 
     # Skip gathering scales if we have static quantization
     # (the scale is a scalar, replicated on all ranks) or
     # if quantization is deferred.
-    skip_gather_scales = a1q_scale is None or a1q_scale.ndim == 0
-    scales = None if skip_gather_scales else [a1q_scale]
+    scales: list[torch.Tensor] | None
+    if isinstance(a1q_scale, tuple):
+        skip_gather_scales = False
+        scales = list(a1q_scale)
+    else:
+        skip_gather_scales = a1q_scale is None or a1q_scale.ndim == 0
+        scales = None if skip_gather_scales else [a1q_scale]
 
     return a1q, scales
 
@@ -55,9 +61,18 @@ def _quantize_and_setup_dispatch(
 def _unwrap_scale_and_prepare_for_moe(
     scales: list[torch.Tensor] | None,
     quant_config: FusedMoEQuantConfig,
-) -> torch.Tensor:
-    assert scales is not None and len(scales) == 1
-    a1q_scale = scales[0]
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    assert scales is not None
+    if quant_config.use_nvfp4_per_token_scale:
+        assert len(scales) == 2
+        a1q_scale = (scales[0], scales[1])
+    else:
+        assert len(scales) == 1
+        a1q_scale = scales[0]
+
+    if isinstance(a1q_scale, tuple):
+        return a1q_scale
+
     # Apply swizzling after a2a if the MoE kernel needs it.
     if quant_config.quant_dtype == "nvfp4" and quant_config.is_scale_swizzled:
         assert a1q_scale is not None

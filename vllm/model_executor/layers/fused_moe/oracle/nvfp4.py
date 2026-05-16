@@ -465,6 +465,7 @@ def make_nvfp4_moe_quant_config(
                 NvFp4MoeBackend.FLASHINFER_CUTEDSL,
             )
         ),
+        use_nvfp4_per_token_scale=(backend == NvFp4MoeBackend.FLASHINFER_TRTLLM),
     )
 
 
