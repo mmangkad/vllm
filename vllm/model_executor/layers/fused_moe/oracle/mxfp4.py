@@ -47,7 +47,7 @@ logger = init_logger(__name__)
 
 if has_triton_kernels():
     try:
-        from triton_kernels.matmul_ogs import PrecisionConfig
+        from triton_kernels.matmul import PrecisionConfig
     except (ImportError, AttributeError) as e:
         logger.error(
             "Failed to import Triton kernels. Please make sure your triton "
@@ -998,7 +998,7 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
 
     elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_FP8:
         # W4A8: MXFP4 weights + static FP8 activations (triton kernel)
-        from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+        from triton_kernels.matmul import FlexCtx, PrecisionConfig
         from triton_kernels.numerics import InFlexData
 
         if w13_bias is not None:
@@ -1033,11 +1033,11 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
 
         # Create PrecisionConfig with both weight and activation info
         w13_precision_config = PrecisionConfig(
-            weight_scale=w13_scale,
+            b_mx_scale=w13_scale,
             flex_ctx=FlexCtx(rhs_data=w13_flex, lhs_data=lhs_data13),
         )
         w2_precision_config = PrecisionConfig(
-            weight_scale=w2_scale,
+            b_mx_scale=w2_scale,
             flex_ctx=FlexCtx(rhs_data=w2_flex, lhs_data=lhs_data2),
         )
 
@@ -1054,7 +1054,7 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         )
 
     elif mxfp4_backend in TRITON_BACKENDS:
-        from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+        from triton_kernels.matmul import FlexCtx, PrecisionConfig
 
         if w13_bias is not None:
             w13_bias = w13_bias.to(torch.float32)
@@ -1071,10 +1071,10 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         )
 
         w13_precision_config = PrecisionConfig(
-            weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+            b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
         )
         w2_precision_config = PrecisionConfig(
-            weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+            b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
         )
 
         del layer.w13_weight
@@ -1366,7 +1366,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         )
 
     elif mxfp4_backend in TRITON_BACKENDS:
-        from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+        from triton_kernels.matmul import FlexCtx, PrecisionConfig
 
         if mxfp4_backend == Mxfp4MoeBackend.TRITON:
 
@@ -1400,10 +1400,10 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         )
 
         w13_precision_config = PrecisionConfig(
-            weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+            b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
         )
         w2_precision_config = PrecisionConfig(
-            weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+            b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
         )
 
         del layer.w13_weight

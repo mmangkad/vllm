@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -209,37 +211,43 @@ def _patch_make_bitmatrix_metadata() -> None:
     _bm.make_bitmatrix_metadata = _make_bitmatrix_metadata_pow2_safe
 
 
-use_legacy_triton_kernels = False
+@dataclass
+class RoutingData:
+    gate_scal: torch.Tensor
+    expt_hist: torch.Tensor | None
+    n_expts_tot: int
+    n_expts_act: int
+    expt_data: object | None = None
+
+
+@dataclass
+class GatherIndx:
+    src_indx: torch.Tensor
+    dst_indx: torch.Tensor
+
+
+@dataclass
+class ScatterIndx:
+    src_indx: torch.Tensor
+    dst_indx: torch.Tensor
+
 
 if has_triton_kernels():
     try:
         import triton_kernels.swiglu
-        from triton_kernels.matmul_ogs import (
+        from triton_kernels.matmul import (
             FnSpecs,
             FusedActivation,
-            GatherIndx,
-            RoutingData,
-            ScatterIndx,
-            matmul_ogs,
+            matmul,
         )
         from triton_kernels.tensor import (
-            BIT,
-            Bitmatrix,
+            SparseMatrix,
+            make_ragged_tensor_metadata,
+            wrap_torch_tensor,
         )
+        from triton_kernels.tensor_details.dtype import BIT
 
-        try:
-            from triton_kernels.tensor import (
-                SparseMatrix,
-                make_ragged_tensor_metadata,
-            )
-        except ImportError:
-            if current_platform.is_rocm():
-                logger.warning_once("Using legacy triton_kernels on ROCm")
-                use_legacy_triton_kernels = True
-            else:
-                raise
-        if not use_legacy_triton_kernels:
-            _patch_make_bitmatrix_metadata()
+        _patch_make_bitmatrix_metadata()
     except (AttributeError, ImportError) as e:
         logger.error(
             "Failed to import Triton kernels. Please make sure your triton "
@@ -416,53 +424,62 @@ def triton_kernel_fused_experts(
             dtype=hidden_states.dtype,
         )
 
-    # Add batch_dim to output buffer because matmul_ogs expects 3D output
     intermediate_cache = _resize_cache(
         intermediate_cache, (batch_dim, M * topk, N // 2)
     )
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
-    act = (
-        FusedActivation(
-            FnSpecs(
-                "swiglu",
-                triton_kernels.swiglu.swiglu_fn,
-                ("alpha", "limit"),
-                reduction_n=2,
-            ),
-            (swiglu_alpha, swiglu_limit),
-        )
-        if not use_legacy_triton_kernels
-        else FusedActivation(
-            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
-            (swiglu_alpha, swiglu_limit),
-            2,
-        )
+    act = FusedActivation(
+        FnSpecs(
+            "swiglu",
+            triton_kernels.swiglu.swiglu_fn,
+            ("alpha", "limit"),
+            reduction_n=2,
+        ),
+        (swiglu_alpha, swiglu_limit),
     )
     gammas = routing_data.gate_scal if routing_data else None
 
-    matmul_ogs(
+    matmul(
         hidden_states,
         w1,
         quant_config.w1_bias,
-        routing_data,
-        gather_indx=gather_indx,
+        a_ragged_metadata=routing_data.expt_data if routing_data else None,
+        gather_indx=torch.div(
+            gather_indx.src_indx, routing_data.n_expts_act, rounding_mode="trunc"
+        )
+        if gather_indx is not None and routing_data is not None
+        else None,
         precision_config=quant_config.w1_precision,
         gammas=gammas if apply_router_weight_on_input else None,
         fused_activation=act,
-        y=intermediate_cache,
+        c=intermediate_cache,
     )
 
-    matmul_ogs(
+    w2_intermediate = torch.empty(
+        (batch_dim, M * topk, K),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    matmul(
         intermediate_cache.view(M * topk, N // 2),
         w2,
         quant_config.w2_bias,
-        routing_data,
-        scatter_indx=scatter_indx,
+        a_ragged_metadata=routing_data.expt_data if routing_data else None,
+        scatter_indx=scatter_indx.dst_indx if scatter_indx is not None else None,
         precision_config=quant_config.w2_precision,
         gammas=None if apply_router_weight_on_input else gammas,
-        y=output_tensor,
+        c=w2_intermediate,
     )
+    if scatter_indx is not None:
+        mask = (scatter_indx.src_indx != -1).view(M, topk, 1)
+        output_tensor.copy_(
+            w2_intermediate.view(batch_dim, M, topk, K)
+            .masked_fill(~mask.unsqueeze(0), 0)
+            .sum(dim=2)
+        )
+    else:
+        output_tensor.copy_(w2_intermediate)
     output_tensor = output_tensor.view(M, K)
     return output_tensor
 
@@ -498,28 +515,12 @@ def make_routing_data(
 
     bitmatrix_shape = [n_rows, bm_cols * 32]
     bitmatrix_shape_max = [n_rows, None]
-    bitmatrix = (
-        Bitmatrix(
-            bitmatrix, dtype=BIT, shape=bitmatrix_shape, shape_max=bitmatrix_shape_max
-        )
-        if not use_legacy_triton_kernels
-        else Bitmatrix(
-            bitmatrix,
-            shape=bitmatrix_shape,
-            shape_max=bitmatrix_shape_max,
-            scratchpad=None,
-        )
+    bitmatrix = wrap_torch_tensor(
+        bitmatrix, dtype=BIT, shape=bitmatrix_shape, shape_max=bitmatrix_shape_max
     )
 
-    # matmul_ogs expects invalid topk_weights to be -1s
+    # Triton grouped matmul expects invalid topk_weights to be -1s.
     topk_weights = torch.where(topk_ids == -1, -1.0, topk_weights)
-
-    if use_legacy_triton_kernels:
-        from triton_kernels.routing import routing_from_bitmatrix
-
-        return routing_from_bitmatrix(
-            bitmatrix, topk_weights, topk_ids, num_local_experts, num_topk
-        )
 
     sparse_logits = SparseMatrix(indx=topk_ids, vals=topk_weights, mask=bitmatrix)
     dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
@@ -531,7 +532,7 @@ def make_routing_data(
     gate_scal = sparse_logits.vals.flatten()[combine_indx]
     routing_data = RoutingData(
         gate_scal,
-        ragged_batch_metadata.block_sizes,
+        sparse_logits.mask_metadata.col_sum,
         num_local_experts,
         num_topk,
         ragged_batch_metadata,
@@ -709,7 +710,7 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
     """
     A Triton based MoE expert class that operates on expert standard
     format and explicitly keeps the activation and reduction (moe_sum) steps
-    unfused from the matmul_ogs kernel. This exposes injection points
+    unfused from the Triton grouped matmul. This exposes injection points
     for activation and moe_sum.
 
     One use case for it is to inject LoRA modules on the activation and moe_sum.
@@ -846,16 +847,20 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
 
         gammas = routing_data.gate_scal if routing_data else None
 
-        matmul_ogs(
+        matmul(
             hidden_states,
             w1,
             quant_config.w1_bias,
-            routing_data,
-            gather_indx=gather_indx,
+            a_ragged_metadata=routing_data.expt_data if routing_data else None,
+            gather_indx=torch.div(
+                gather_indx.src_indx, routing_data.n_expts_act, rounding_mode="trunc"
+            )
+            if gather_indx is not None and routing_data is not None
+            else None,
             precision_config=quant_config.w1_precision,
             gammas=gammas if apply_router_weight_on_input else None,
             fused_activation=None,
-            y=intermediate_cache1,
+            c=intermediate_cache1,
         )
 
         # w13 LoRA: gather the activation input from expert-sorted
@@ -894,23 +899,18 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
             act_input,
         )
 
-        # matmul_ogs grouped reduction fuses sum across multiple experts:
-        # y[dst_indx // n_expts_act, :] += x
-        # Set n_expts_act to 1 to unfuse the sum so we can do it manually via moe_sum.
-        routing_data.n_expts_act = 1
-
-        matmul_ogs(
+        matmul(
             intermediate_cache2[gather_indx.src_indx],
             w2,
             quant_config.w2_bias,
-            routing_data,
-            scatter_indx=scatter_indx,
+            a_ragged_metadata=routing_data.expt_data if routing_data else None,
+            scatter_indx=scatter_indx.dst_indx if scatter_indx is not None else None,
             precision_config=quant_config.w2_precision,
             gammas=None if apply_router_weight_on_input else gammas,
-            y=intermediate_cache3,
+            c=intermediate_cache3,
         )
 
-        # w2 LoRA: after matmul_ogs with scatter_indx, intermediate_cache3 is
+        # w2 LoRA: after matmul with scatter_indx, intermediate_cache3 is
         # in token-topk order, matching the (M, topk, K) layout add_lora_w2 expects.
         if lora_context is not None:
             self.apply_w2_lora(

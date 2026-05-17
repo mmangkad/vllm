@@ -15,9 +15,9 @@ if not has_triton_kernels():
         allow_module_level=True,
     )
 
-import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+import triton_kernels.matmul_details.opt_flags as opt_flags
 import triton_kernels.swiglu
-from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+from triton_kernels.matmul import FlexCtx, PrecisionConfig
 from triton_kernels.numerics import InFlexData
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
@@ -165,10 +165,10 @@ def init_compute_data(M, K, N, E, a_dtype: str, w_dtype: str, num_warps: int):
         )
 
         pc1 = PrecisionConfig(
-            weight_scale=w1_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
+            b_mx_scale=w1_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
         )
         pc2 = PrecisionConfig(
-            weight_scale=w2_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
+            b_mx_scale=w2_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
         )
 
         # tucuate so the rest can run properly

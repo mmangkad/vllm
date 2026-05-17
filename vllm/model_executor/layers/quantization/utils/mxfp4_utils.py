@@ -22,7 +22,7 @@ CK_MXFP4_MOE_DIM_ALIGNMENT = 256
 def _swizzle_mxfp4(quant_tensor, scale, num_warps=8):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     assert has_triton_kernels()
-    import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+    import triton_kernels.matmul_details.opt_flags as opt_flags
     from triton_kernels.numerics import InFlexData
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout

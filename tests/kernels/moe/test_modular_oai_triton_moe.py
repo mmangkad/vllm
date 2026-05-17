@@ -17,7 +17,7 @@ if not has_triton_kernels():
         allow_module_level=True,
     )
 
-from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+from triton_kernels.matmul import FlexCtx, PrecisionConfig
 from triton_kernels.numerics import InFlexData
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
@@ -102,10 +102,10 @@ def make_weights(dtype, k, n, e):
     )
 
     w1_precision_config = PrecisionConfig(
-        weight_scale=w1_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
+        b_mx_scale=w1_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
     )
     w2_precision_config = PrecisionConfig(
-        weight_scale=w2_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
+        b_mx_scale=w2_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
     )
 
     return (
