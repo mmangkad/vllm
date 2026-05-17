@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
-
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -211,27 +209,6 @@ def _patch_make_bitmatrix_metadata() -> None:
     _bm.make_bitmatrix_metadata = _make_bitmatrix_metadata_pow2_safe
 
 
-@dataclass
-class RoutingData:
-    gate_scal: torch.Tensor
-    expt_hist: torch.Tensor | None
-    n_expts_tot: int
-    n_expts_act: int
-    expt_data: object | None = None
-
-
-@dataclass
-class GatherIndx:
-    src_indx: torch.Tensor
-    dst_indx: torch.Tensor
-
-
-@dataclass
-class ScatterIndx:
-    src_indx: torch.Tensor
-    dst_indx: torch.Tensor
-
-
 if has_triton_kernels():
     try:
         import triton_kernels.swiglu
@@ -338,17 +315,29 @@ def triton_kernel_moe_forward(
         # topk_ids_raw contains global expert IDs - remap to local.
         topk_ids = expert_map[topk_ids_raw.to(torch.long)]
         local_num_experts = w1.shape[0]
-        routing_data, gather_idx, scatter_idx = make_routing_data(
-            topk_ids, topk_weights, local_num_experts
-        )
+        (
+            a_ragged_metadata,
+            gather_idx,
+            scatter_idx,
+            gate_scal,
+            n_expts_act,
+            dispatch_idx,
+            _combine_idx,
+        ) = make_routing_data(topk_ids, topk_weights, local_num_experts)
         # expert_map already applied; pass None downstream.
         effective_expert_map = None
         effective_global_num_experts = local_num_experts
     else:
         topk_ids = topk_ids_raw.to(torch.long)
-        routing_data, gather_idx, scatter_idx = make_routing_data(
-            topk_ids, topk_weights, gating_output.shape[-1]
-        )
+        (
+            a_ragged_metadata,
+            gather_idx,
+            scatter_idx,
+            gate_scal,
+            n_expts_act,
+            dispatch_idx,
+            _combine_idx,
+        ) = make_routing_data(topk_ids, topk_weights, gating_output.shape[-1])
         effective_expert_map = expert_map
         effective_global_num_experts = global_num_experts
 
@@ -362,15 +351,18 @@ def triton_kernel_moe_forward(
         hidden_states,
         w1,
         w2,
-        routing_data,
+        a_ragged_metadata,
         gather_idx,
         scatter_idx,
+        gate_scal,
+        n_expts_act,
         topk=topk,
         activation=activation,
         quant_config=effective_quant_config,
         apply_router_weight_on_input=apply_router_weight_on_input,
         global_num_experts=effective_global_num_experts,
         expert_map=effective_expert_map,
+        dispatch_indx=dispatch_idx,
     )
 
 
@@ -380,9 +372,11 @@ def triton_kernel_fused_experts(
     hidden_states: torch.Tensor,
     w1,  # Tensor or triton_kernels.Tensor
     w2,  # Tensor or triton_kernels.Tensor
-    routing_data,  # RoutingData
-    gather_indx,  # GatherIndx
-    scatter_indx,  # ScatterIndx
+    a_ragged_metadata,
+    gather_indx: torch.Tensor,
+    scatter_indx: torch.Tensor,
+    gate_scal: torch.Tensor,
+    n_expts_act: int,
     topk: int,
     activation: MoEActivation = MoEActivation.SWIGLUOAI,
     quant_config: FusedMoEQuantConfig | None = None,
@@ -393,6 +387,7 @@ def triton_kernel_fused_experts(
     expert_map: torch.Tensor | None = None,
     intermediate_cache: torch.Tensor | None = None,
     a1q_scale: torch.Tensor | None = None,
+    dispatch_indx: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of fused expert computation using OAI kernels."""
     assert activation == MoEActivation.SWIGLUOAI, (
@@ -417,15 +412,17 @@ def triton_kernel_fused_experts(
     if global_num_experts == -1:
         global_num_experts = E
 
+    assert n_expts_act == topk
+
     if intermediate_cache is None:
         intermediate_cache = torch.empty(
-            (batch_dim, M * topk, N // 2),
+            (batch_dim, M * n_expts_act, N // 2),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
 
     intermediate_cache = _resize_cache(
-        intermediate_cache, (batch_dim, M * topk, N // 2)
+        intermediate_cache, (batch_dim, M * n_expts_act, N // 2)
     )
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
@@ -438,48 +435,38 @@ def triton_kernel_fused_experts(
         ),
         (swiglu_alpha, swiglu_limit),
     )
-    gammas = routing_data.gate_scal if routing_data else None
-
     matmul(
         hidden_states,
         w1,
         quant_config.w1_bias,
-        a_ragged_metadata=routing_data.expt_data if routing_data else None,
-        gather_indx=torch.div(
-            gather_indx.src_indx, routing_data.n_expts_act, rounding_mode="trunc"
-        )
-        if gather_indx is not None and routing_data is not None
-        else None,
+        a_ragged_metadata=a_ragged_metadata,
+        gather_indx=gather_indx,
         precision_config=quant_config.w1_precision,
-        gammas=gammas if apply_router_weight_on_input else None,
+        gammas=gate_scal if apply_router_weight_on_input else None,
         fused_activation=act,
         c=intermediate_cache,
     )
 
     w2_intermediate = torch.empty(
-        (batch_dim, M * topk, K),
+        (batch_dim, M * n_expts_act, K),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     matmul(
-        intermediate_cache.view(M * topk, N // 2),
+        intermediate_cache.view(M * n_expts_act, N // 2),
         w2,
         quant_config.w2_bias,
-        a_ragged_metadata=routing_data.expt_data if routing_data else None,
-        scatter_indx=scatter_indx.dst_indx if scatter_indx is not None else None,
+        a_ragged_metadata=a_ragged_metadata,
+        scatter_indx=scatter_indx,
         precision_config=quant_config.w2_precision,
-        gammas=None if apply_router_weight_on_input else gammas,
+        gammas=None if apply_router_weight_on_input else gate_scal,
         c=w2_intermediate,
     )
-    if scatter_indx is not None:
-        mask = (scatter_indx.src_indx != -1).view(M, topk, 1)
-        output_tensor.copy_(
-            w2_intermediate.view(batch_dim, M, topk, K)
-            .masked_fill(~mask.unsqueeze(0), 0)
-            .sum(dim=2)
-        )
-    else:
-        output_tensor.copy_(w2_intermediate)
+    w2_intermediate = w2_intermediate.view(batch_dim, M, n_expts_act, K)
+    if dispatch_indx is not None:
+        mask = (dispatch_indx != -1).view(M, n_expts_act, 1)
+        w2_intermediate = w2_intermediate.masked_fill(~mask.unsqueeze(0), 0)
+    output_tensor.copy_(w2_intermediate.sum(dim=2))
     output_tensor = output_tensor.view(M, K)
     return output_tensor
 
@@ -488,7 +475,7 @@ def make_routing_data(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_local_experts: int,
-) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
+):
     topk_ids = topk_ids.to(torch.int16)
     topk_weights = topk_weights.to(torch.bfloat16)
 
@@ -530,16 +517,17 @@ def make_routing_data(
         dispatch_indx.shape[0],
     )
     gate_scal = sparse_logits.vals.flatten()[combine_indx]
-    routing_data = RoutingData(
-        gate_scal,
-        sparse_logits.mask_metadata.col_sum,
-        num_local_experts,
-        num_topk,
+    gather_indx = torch.div(combine_indx, num_topk, rounding_mode="trunc")
+    scatter_indx = combine_indx
+    return (
         ragged_batch_metadata,
+        gather_indx,
+        scatter_indx,
+        gate_scal,
+        num_topk,
+        dispatch_indx,
+        combine_indx,
     )
-    gather_indx = GatherIndx(combine_indx, dispatch_indx)
-    scatter_indx = ScatterIndx(dispatch_indx, combine_indx)
-    return routing_data, gather_indx, scatter_indx
 
 
 class BaseOAITritonExperts(mk.FusedMoEExpertsModular):
@@ -621,7 +609,7 @@ class BaseOAITritonExperts(mk.FusedMoEExpertsModular):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         num_local_experts: int,
-    ) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
+    ):
         return make_routing_data(topk_ids, topk_weights, num_local_experts)
 
 
@@ -682,9 +670,15 @@ class OAITritonExperts(BaseOAITritonExperts):
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        routing_data, gather_indx, scatter_indx = self._make_routing_data(
-            topk_ids, topk_weights, local_num_experts
-        )
+        (
+            a_ragged_metadata,
+            gather_indx,
+            scatter_indx,
+            gate_scal,
+            n_expts_act,
+            dispatch_indx,
+            _combine_indx,
+        ) = self._make_routing_data(topk_ids, topk_weights, local_num_experts)
 
         topk = topk_ids.size(1)
         triton_kernel_fused_experts(
@@ -692,9 +686,11 @@ class OAITritonExperts(BaseOAITritonExperts):
             hidden_states,
             w1,
             w2,
-            routing_data,
+            a_ragged_metadata,
             gather_indx,
             scatter_indx,
+            gate_scal,
+            n_expts_act,
             topk=topk,
             activation=activation,
             quant_config=self.quant_config,
@@ -703,6 +699,7 @@ class OAITritonExperts(BaseOAITritonExperts):
             expert_map=None,  # applied already
             intermediate_cache=workspace2,
             a1q_scale=a1q_scale,
+            dispatch_indx=dispatch_indx,
         )
 
 
@@ -812,9 +809,15 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        routing_data, gather_indx, scatter_indx = self._make_routing_data(
-            topk_ids, topk_weights, local_num_experts
-        )
+        (
+            a_ragged_metadata,
+            gather_indx,
+            scatter_indx,
+            gate_scal,
+            n_expts_act,
+            dispatch_indx,
+            combine_indx,
+        ) = self._make_routing_data(topk_ids, topk_weights, local_num_experts)
 
         topk = topk_ids.size(1)
 
@@ -845,18 +848,15 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         intermediate_cache2 = _resize_cache(workspace13, (M * topk, activation_out_dim))
 
-        gammas = routing_data.gate_scal if routing_data else None
+        assert n_expts_act == topk
+        gammas = gate_scal
 
         matmul(
             hidden_states,
             w1,
             quant_config.w1_bias,
-            a_ragged_metadata=routing_data.expt_data if routing_data else None,
-            gather_indx=torch.div(
-                gather_indx.src_indx, routing_data.n_expts_act, rounding_mode="trunc"
-            )
-            if gather_indx is not None and routing_data is not None
-            else None,
+            a_ragged_metadata=a_ragged_metadata,
+            gather_indx=gather_indx,
             precision_config=quant_config.w1_precision,
             gammas=gammas if apply_router_weight_on_input else None,
             fused_activation=None,
@@ -867,7 +867,7 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
         # intermediate_cache1, then add the LoRA delta in-place on that copy
         # before passing it to activation — exactly mirroring the old
         # decorator approach which modified the gathered tensor in-place.
-        act_input = intermediate_cache1.view(-1, N)[gather_indx.dst_indx]
+        act_input = intermediate_cache1.view(-1, N)[dispatch_indx]
 
         sorted_token_ids_lora = None
         expert_ids_lora = None
@@ -900,11 +900,11 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
         )
 
         matmul(
-            intermediate_cache2[gather_indx.src_indx],
+            intermediate_cache2[combine_indx],
             w2,
             quant_config.w2_bias,
-            a_ragged_metadata=routing_data.expt_data if routing_data else None,
-            scatter_indx=scatter_indx.dst_indx if scatter_indx is not None else None,
+            a_ragged_metadata=a_ragged_metadata,
+            scatter_indx=scatter_indx,
             precision_config=quant_config.w2_precision,
             gammas=None if apply_router_weight_on_input else gammas,
             c=intermediate_cache3,

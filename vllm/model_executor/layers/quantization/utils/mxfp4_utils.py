@@ -41,33 +41,30 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps=8):
             "this cause swizling to be disabled, which may "
             "cause performance degradation. Please upgrade to torch nightly"
         )
-        value_layout = StridedLayout
-        scale_layout = StridedLayout
+        value_layout = StridedLayout(-2)
+        scale_layout = StridedLayout(-2)
     elif current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx950
 
-        value_layout = StridedLayout
+        value_layout = StridedLayout(-2)
         if on_gfx950():
             try:
                 # triton < 3.6
                 from triton_kernels.tensor_details.layout import GFX950MXScaleLayout
 
-                scale_layout = GFX950MXScaleLayout
+                scale_layout = GFX950MXScaleLayout()
             except ImportError:
                 # triton >= 3.6
                 from triton_kernels.tensor_details.layout import CDNA4MXScaleLayout
 
-                scale_layout = CDNA4MXScaleLayout
+                scale_layout = CDNA4MXScaleLayout()
         else:
-            scale_layout = StridedLayout
+            scale_layout = StridedLayout(-2)
     else:
-        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-            mx_axis=1
-        )
-        scale_layout, scale_layout_opts = (
-            layout.make_default_matmul_mxfp4_w_scale_layout(
-                mx_axis=1, num_warps=num_warps
-            )
+        value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+        scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+            mx_axis=-2,
+            num_warps=num_warps,
         )
     if current_platform.is_cuda():
         if current_platform.is_device_capability(90):

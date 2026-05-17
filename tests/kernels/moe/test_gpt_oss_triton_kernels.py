@@ -133,12 +133,13 @@ def init_compute_data(M, K, N, E, a_dtype: str, w_dtype: str, num_warps: int):
 
         x_tri = F.pad(x_tri, (0, x_pad, 0, 0), mode="constant", value=0)
 
-        w_layout, w_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
-        w_scale_layout, w_scale_layout_opts = (
-            layout.make_default_matmul_mxfp4_w_scale_layout(
-                mx_axis=1, num_warps=num_warps
-            )
+        w_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+        w_layout_opts: dict[str, object] = {}
+        w_scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+            mx_axis=-2,
+            num_warps=num_warps,
         )
+        w_scale_layout_opts: dict[str, object] = {}
 
         w1_tri, w1_scale_tri = downcast_to_mxfp(w1_tri, torch.uint8, axis=1)
         w1 = upcast_from_mxfp(w1_tri, w1_scale_tri, torch.bfloat16, axis=1)

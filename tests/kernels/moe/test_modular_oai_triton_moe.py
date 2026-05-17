@@ -82,10 +82,13 @@ def make_weights(dtype, k, n, e):
     w2 = upcast_from_mxfp(w2_tri, w2_scale_tri, dtype, axis=1)
 
     num_warps = 8
-    w_layout, w_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
-    w_scale_layout, w_scale_layout_opts = (
-        layout.make_default_matmul_mxfp4_w_scale_layout(mx_axis=1, num_warps=num_warps)
+    w_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+    w_layout_opts: dict[str, object] = {}
+    w_scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=-2,
+        num_warps=num_warps,
     )
+    w_scale_layout_opts: dict[str, object] = {}
 
     w1_tri = convert_layout(wrap_torch_tensor(w1_tri, FP4), w_layout, **w_layout_opts)
     w1_scale_tri = convert_layout(

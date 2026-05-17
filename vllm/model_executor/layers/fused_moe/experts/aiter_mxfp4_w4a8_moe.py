@@ -76,9 +76,9 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
     hidden_states: torch.Tensor,
     w1,  # Tensor or triton_kernels.Tensor
     w2,  # Tensor or triton_kernels.Tensor
-    routing_data,  # RoutingData
-    gather_indx,  # GatherIndx
-    scatter_indx,  # ScatterIndx
+    routing_data,
+    gather_indx,
+    scatter_indx,
     activation: str = "silu",
     quant_config: FusedMoEQuantConfig | None = None,
     swiglu_alpha: float = 1.702,
@@ -128,7 +128,7 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
         hidden_states,
         w1.storage.data,
         None,
-        quant_config.w1_precision.weight_scale.storage.data,
+        quant_config.w1_precision.b_mx_scale.storage.data,
         quant_config.w1_precision.flex_ctx.lhs_data.scale,
         quant_config.w2_precision.flex_ctx.lhs_data.scale,
         quant_config.w1_bias,
@@ -148,7 +148,7 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
         intermediate_cache1,
         w2.storage.data,
         None,
-        quant_config.w2_precision.weight_scale.storage.data,
+        quant_config.w2_precision.b_mx_scale.storage.data,
         quant_config.w2_precision.flex_ctx.lhs_data.scale,
         None,
         quant_config.w2_bias,

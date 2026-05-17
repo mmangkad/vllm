@@ -421,13 +421,35 @@ def has_nixl_ep() -> bool:
 
 
 def has_triton_kernels() -> bool:
-    """Whether the optional `triton_kernels` package is available."""
+    """Whether a Triton 3.7-compatible `triton_kernels` package is available."""
     is_available = _has_module("triton_kernels") or _has_module(
         "vllm.third_party.triton_kernels"
     )
-    if is_available:
+    if not is_available:
+        return False
+
+    try:
+        import dataclasses
+
         import_triton_kernels()
-    return is_available
+        from triton_kernels.matmul import PrecisionConfig
+
+        precision_fields = {field.name for field in dataclasses.fields(PrecisionConfig)}
+        if "b_mx_scale" not in precision_fields:
+            return False
+
+        required_modules = (
+            "triton_kernels.matmul",
+            "triton_kernels.matmul_details.opt_flags",
+            "triton_kernels.swiglu",
+            "triton_kernels.tensor_details.ragged_tensor",
+            "triton_kernels.topk",
+        )
+        return all(
+            importlib.util.find_spec(module) is not None for module in required_modules
+        )
+    except (ImportError, ModuleNotFoundError, TypeError):
+        return False
 
 
 def has_tilelang() -> bool:
