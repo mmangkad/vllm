@@ -421,7 +421,7 @@ def has_nixl_ep() -> bool:
 
 
 def has_triton_kernels() -> bool:
-    """Whether a Triton 3.7-compatible `triton_kernels` package is available."""
+    """Whether a compatible `triton_kernels` package is available."""
     is_available = _has_module("triton_kernels") or _has_module(
         "vllm.third_party.triton_kernels"
     )
