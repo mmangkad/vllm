@@ -174,11 +174,14 @@ if flashinfer_comm is not None:
             max_one_shot_size is None or current_tensor_size <= max_one_shot_size * MiB
         )
 
-        # Select workspace based on pattern: quant patterns use the
-        # trtllm quant workspace, non-quant patterns use the primary workspace.
+        # Select workspace based on pattern: quant patterns may need a
+        # separately initialized FlashInfer workspace, but use the same
+        # configured backend as non-quant patterns.
         is_quant_pattern = pattern_code in (
             ar_fusion_patterns.kARResidualRMSNormFP8Quant,
             ar_fusion_patterns.kARResidualRMSNormFP4Quant,
+            ar_fusion_patterns.kARResidualRMSNormOutFP8Quant,
+            ar_fusion_patterns.kARResidualRMSNormOutFP4Quant,
         )
         get_workspace_fn = (
             get_fi_ar_quant_workspace if is_quant_pattern else get_fi_ar_workspace
@@ -205,9 +208,9 @@ if flashinfer_comm is not None:
             residual_out = allreduce_in
 
         layout_code = None
-        # layout_code only supported by trtllm backend
-        if workspace.backend == "trtllm":
-            # in vllm we only support swizzled layout
+        # In vLLM the fused NVFP4 path uses swizzled scale-factor layout.
+        # TRT-LLM and MNNVL both accept SWIZZLED_128x4.
+        if workspace.backend in ("trtllm", "mnnvl"):
             layout_code = flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4
 
         flashinfer_comm.allreduce_fusion(

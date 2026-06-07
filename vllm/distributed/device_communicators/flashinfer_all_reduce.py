@@ -23,6 +23,7 @@ logger = init_logger(__name__)
 PDL_ADVANCE_LAUNCH_TOKENS = 16
 
 fi_ar_available = False
+fi_mnnvl_quant_available = False
 try:
     import flashinfer.comm as flashinfer_comm  # type: ignore[no-redef]
     from flashinfer.comm.mnnvl import (
@@ -30,12 +31,25 @@ try:
     )
 
     fi_ar_available = hasattr(flashinfer_comm, "allreduce_fusion")
+    if fi_ar_available:
+        try:
+            from flashinfer.comm import trtllm_mnnvl_ar
+
+            fi_mnnvl_quant_available = hasattr(
+                trtllm_mnnvl_ar, "MNNVLQuantType"
+            ) and hasattr(
+                trtllm_mnnvl_ar,
+                "trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant",
+            )
+        except ImportError:
+            pass
 except ImportError:
     pass
 
-# Workspace for standalone allreduce and non-quant ar+rms fusion
+# Workspace for standalone allreduce and non-quant ar+rms fusion.
 _fi_ar_workspace = None
-# Extra workspace for quant fusion patterns (only supported by trtllm backend)
+# Extra workspace for quant fusion patterns. This can use either TRT-LLM or
+# MNNVL; the backend is selected the same way as the non-quant workspace.
 _fi_ar_quant_workspace = None
 
 
@@ -172,38 +186,58 @@ def get_fi_ar_quant_workspace(
     """
     Return the allreduce workspace for quant patterns, initializing if needed.
 
-    Always uses trtllm backend as it is the only one supporting quantization
-    fusion (FP8/FP4). Returns None for multi-node setups since not supported
-    by trtllm backend.
+    Uses the configured FlashInfer allreduce backend. TRT-LLM and MNNVL both
+    support the standard post-RMSNorm quantization patterns used by vLLM
+    (static FP8 and NVFP4).
     """
     global _fi_ar_quant_workspace
     if _fi_ar_quant_workspace is not None:
         return _fi_ar_quant_workspace
 
-    if get_node_count() > 1:
-        logger.warning_once(
-            "Flashinfer allreduce quantization fusion is not supported for "
-            "multi-node allreduce. Disabling quant fusion."
-        )
-        return None
+    backend = _resolve_fi_ar_backend()
+    node_count = get_node_count()
 
-    # Reuse the non-quant workspace if it was already created with trtllm
-    if _fi_ar_workspace is not None and _fi_ar_workspace.backend == "trtllm":
+    if backend == "mnnvl" and not fi_mnnvl_quant_available:
+        if node_count > 1:
+            logger.warning_once(
+                "FlashInfer MNNVL allreduce quantization fusion is not "
+                "available in this FlashInfer installation. Disabling "
+                "allreduce-norm-quant fusion."
+            )
+            return None
+        logger.warning_once(
+            "FlashInfer MNNVL allreduce quantization fusion is not available "
+            "in this FlashInfer installation. Falling back to the TRT-LLM "
+            "backend for allreduce-norm-quant fusion."
+        )
+        backend = "trtllm"
+
+    if node_count > 1 and backend == "trtllm":
+        raise ValueError(
+            "Flashinfer allreduce quantization fusion is not supported for "
+            "multi-node allreduce with 'trtllm' backend. Please use 'mnnvl' "
+            "backend instead."
+        )
+
+    # Reuse the non-quant workspace if it was already created with the same
+    # backend. FlashInfer workspaces are sized by input dtype/shape and can be
+    # used for the standard quant and non-quant RMSNorm fusion patterns.
+    if _fi_ar_workspace is not None and _fi_ar_workspace.backend == backend:
         _fi_ar_quant_workspace = _fi_ar_workspace
         return _fi_ar_quant_workspace
 
     _fi_ar_quant_workspace = _create_workspace(
-        "trtllm", world_size, rank, max_token_num, hidden_dim, dtype, group
+        backend, world_size, rank, max_token_num, hidden_dim, dtype, group
     )
     if _fi_ar_quant_workspace is not None:
         logger.info_once(
             "Initialized FlashInfer Allreduce norm quantization "
-            "fusion workspace with backend=trtllm"
+            f"fusion workspace with backend={backend}"
         )
     else:
         logger.warning_once(
             "Failed to initialize FlashInfer Allreduce norm quantization "
-            "fusion workspace with backend=trtllm"
+            f"fusion workspace with backend={backend}"
         )
 
     return _fi_ar_quant_workspace
