@@ -61,9 +61,12 @@ def _create_workspace(
     hidden_dim: int,
     dtype: torch.dtype,
     group: ProcessGroup,
+    use_multicast: bool,
 ):
     """Create a flashinfer allreduce workspace, returning None on failure."""
     comm_backend = TorchDistBackend(group=group)
+    node_count = get_node_count()
+    gpus_per_node = max(1, world_size // node_count)
     rng_state = random.getstate()
     try:
         random.seed(int.from_bytes(os.urandom(16), byteorder="big"))
@@ -74,7 +77,9 @@ def _create_workspace(
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
+            gpus_per_node=gpus_per_node,
             comm_backend=comm_backend,
+            use_multicast=use_multicast,
         )
     except Exception as e:
         if "multicast" in str(e).lower():
@@ -94,13 +99,15 @@ def _create_workspace(
         random.setstate(rng_state)
     logger.debug(
         "Initialized FlashInfer All Reduce workspace: backend=%s, "
-        "world_size=%d, rank=%d, max_token_num=%d, hidden_dim=%d, dtype=%s",
+        "world_size=%d, rank=%d, max_token_num=%d, hidden_dim=%d, "
+        "dtype=%s, use_multicast=%s",
         backend,
         world_size,
         rank,
         max_token_num,
         hidden_dim,
         dtype,
+        use_multicast,
     )
     return workspace
 
@@ -115,6 +122,9 @@ def _resolve_fi_ar_backend() -> str:
         # Use mnnvl backend for multi-node setup since
         # trtllm backend does not support multi-node allreduce
         backend = "mnnvl"
+    elif not envs.VLLM_FLASHINFER_ALLREDUCE_USE_MULTICAST:
+        # The unicast transport is only implemented by the MNNVL backend.
+        backend = "mnnvl"
     else:
         # Currently defaulting to trtllm backend for single-node
         # setup since mnnvl has issues with cudagraph:
@@ -124,6 +134,14 @@ def _resolve_fi_ar_backend() -> str:
 
     logger.info_once(f"Auto-selected flashinfer allreduce backend: {backend}")
     return backend
+
+
+def _workspace_matches_config(workspace, backend: str, use_multicast: bool) -> bool:
+    if workspace.backend != backend:
+        return False
+    if backend == "mnnvl":
+        return getattr(workspace, "use_multicast", use_multicast) == use_multicast
+    return True
 
 
 def get_fi_ar_workspace(
@@ -146,20 +164,35 @@ def get_fi_ar_workspace(
         return _fi_ar_workspace
 
     backend = _resolve_fi_ar_backend()
+    use_multicast = envs.VLLM_FLASHINFER_ALLREDUCE_USE_MULTICAST
 
     if get_node_count() > 1 and backend == "trtllm":
         raise ValueError(
             "Flashinfer allreduce is not supported for multi-node allreduce with "
             "'trtllm' backend. Please use 'mnnvl' backend instead."
         )
+    if get_node_count() > 1 and backend == "mnnvl" and not use_multicast:
+        raise ValueError(
+            "FlashInfer MNNVL unicast allreduce is single-node only. "
+            "Set VLLM_FLASHINFER_ALLREDUCE_USE_MULTICAST=1 for multi-node MNNVL."
+        )
 
     # Reuse the quant workspace if it was already created with the same backend
-    if _fi_ar_quant_workspace is not None and _fi_ar_quant_workspace.backend == backend:
+    if _fi_ar_quant_workspace is not None and _workspace_matches_config(
+        _fi_ar_quant_workspace, backend, use_multicast
+    ):
         _fi_ar_workspace = _fi_ar_quant_workspace
         return _fi_ar_workspace
 
     _fi_ar_workspace = _create_workspace(
-        backend, world_size, rank, max_token_num, hidden_dim, dtype, group
+        backend,
+        world_size,
+        rank,
+        max_token_num,
+        hidden_dim,
+        dtype,
+        group,
+        use_multicast,
     )
     if _fi_ar_workspace is not None:
         logger.info_once(
@@ -195,6 +228,7 @@ def get_fi_ar_quant_workspace(
         return _fi_ar_quant_workspace
 
     backend = _resolve_fi_ar_backend()
+    use_multicast = envs.VLLM_FLASHINFER_ALLREDUCE_USE_MULTICAST
     node_count = get_node_count()
 
     if backend == "mnnvl" and not fi_mnnvl_quant_available:
@@ -218,16 +252,31 @@ def get_fi_ar_quant_workspace(
             "multi-node allreduce with 'trtllm' backend. Please use 'mnnvl' "
             "backend instead."
         )
+    if node_count > 1 and backend == "mnnvl" and not use_multicast:
+        raise ValueError(
+            "FlashInfer MNNVL unicast allreduce quantization fusion is "
+            "single-node only. Set VLLM_FLASHINFER_ALLREDUCE_USE_MULTICAST=1 "
+            "for multi-node MNNVL."
+        )
 
     # Reuse the non-quant workspace if it was already created with the same
     # backend. FlashInfer workspaces are sized by input dtype/shape and can be
     # used for the standard quant and non-quant RMSNorm fusion patterns.
-    if _fi_ar_workspace is not None and _fi_ar_workspace.backend == backend:
+    if _fi_ar_workspace is not None and _workspace_matches_config(
+        _fi_ar_workspace, backend, use_multicast
+    ):
         _fi_ar_quant_workspace = _fi_ar_workspace
         return _fi_ar_quant_workspace
 
     _fi_ar_quant_workspace = _create_workspace(
-        backend, world_size, rank, max_token_num, hidden_dim, dtype, group
+        backend,
+        world_size,
+        rank,
+        max_token_num,
+        hidden_dim,
+        dtype,
+        group,
+        use_multicast,
     )
     if _fi_ar_quant_workspace is not None:
         logger.info_once(

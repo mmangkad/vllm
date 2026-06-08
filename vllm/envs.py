@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     )
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+    VLLM_FLASHINFER_ALLREDUCE_USE_MULTICAST: bool = True
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1602,6 +1603,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
         "auto",
         ["auto", "trtllm", "mnnvl"],
+    ),
+    # Use CUDA multicast for FlashInfer MNNVL allreduce. Set to 0 to use the
+    # single-node MNNVL unicast transport.
+    "VLLM_FLASHINFER_ALLREDUCE_USE_MULTICAST": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_ALLREDUCE_USE_MULTICAST", "1"))
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
