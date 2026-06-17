@@ -45,7 +45,10 @@ def ref_mla(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("bs", [1, 2, 4, 16])
 @pytest.mark.parametrize("block_size", [32, 64])
-def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
+@pytest.mark.parametrize("backend", ["trtllm-gen", "cute-dsl"])
+def test_flashinfer_mla_decode(
+    dtype: torch.dtype, bs: int, block_size: int, backend: str
+):
     torch.set_default_device("cuda")
     torch.manual_seed(42)
 
@@ -95,7 +98,7 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
 
     workspace_buffer = torch.zeros(
         FLASHINFER_WORKSPACE_BUFFER_SIZE,
-        dtype=torch.uint8,
+        dtype=torch.int8 if backend == "cute-dsl" else torch.uint8,
         device=q.device,
     )
     # Flashinfer MLA expects the query to be of shape
@@ -114,6 +117,7 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
         seq_lens=seq_lens_tensor,
         max_seq_len=max_seq_len,
         bmm1_scale=scale,
+        backend=backend,
     )
     out_ans = out_ans.squeeze(1)
     torch.testing.assert_close(out_ans, out_ref, atol=1e-2, rtol=1e-2)
