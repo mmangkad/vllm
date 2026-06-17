@@ -333,6 +333,15 @@ full_cg_backend_configs = {
         },
         specific_gpu_arch=(10, 0),
     ),
+    # FlashInfer CuteDSL MLA on Blackwell
+    "FlashInferCuteDSLMLA": BackendConfig(
+        name="FlashInferCuteDSLMLA",
+        attention_config={"backend": "FLASHINFER_CUTEDSL_MLA"},
+        comp_config={
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+        },
+        specific_gpu_arch=(10, 0),
+    ),
     # FlashAttention MLA on Hopper
     "FlashAttentionMLA": BackendConfig(
         name="FlashAttentionMLA",

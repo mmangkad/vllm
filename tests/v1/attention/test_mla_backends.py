@@ -43,6 +43,7 @@ BACKENDS_TO_TEST = [
     AttentionBackendEnum.FLASHMLA,
     AttentionBackendEnum.FLASH_ATTN_MLA,
     AttentionBackendEnum.FLASHINFER_MLA,
+    AttentionBackendEnum.FLASHINFER_CUTEDSL_MLA,
     AttentionBackendEnum.TRITON_MLA,
     AttentionBackendEnum.TOKENSPEED_MLA,
 ]
@@ -53,6 +54,7 @@ DEVICE_TYPE = current_platform.device_type
 if not torch.cuda.is_available() or torch.cuda.get_device_properties(0).major < 10:
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.CUTLASS_MLA)
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER_MLA)
+    BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER_CUTEDSL_MLA)
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.TOKENSPEED_MLA)
 
 # Remove FLASH_ATTN_MLA from the list if not supported

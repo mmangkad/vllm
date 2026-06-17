@@ -103,6 +103,19 @@ g_fi_workspace = torch.zeros(
     device="cuda",
 )
 
+g_fi_cutedsl_workspace: torch.Tensor | None = None
+
+
+def _get_fi_cutedsl_workspace() -> torch.Tensor:
+    global g_fi_cutedsl_workspace
+    if g_fi_cutedsl_workspace is None:
+        g_fi_cutedsl_workspace = torch.zeros(
+            FLASHINFER_MLA_WORKSPACE_BUFFER_SIZE,
+            dtype=torch.int8,
+            device="cuda",
+        )
+    return g_fi_cutedsl_workspace
+
 
 class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
     def __init__(
@@ -153,6 +166,9 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
 
+    def _get_decode_kwargs(self) -> dict[str, object]:
+        return {"backend": "trtllm-gen"}
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -200,6 +216,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             max_seq_len=attn_metadata.max_seq_len,
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
+            **self._get_decode_kwargs(),
         )
 
         # Flatten the output for consistent shape
@@ -208,3 +225,119 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # TODO: Return LSE pending support from Flashinfer API:
         # https://github.com/flashinfer-ai/flashinfer/pull/1566
         return o, None
+
+
+class FlashInferCuteDSLMLABackend(FlashInferMLABackend):
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [32, 64]
+
+    @staticmethod
+    def get_name() -> str:
+        return "FLASHINFER_CUTEDSL_MLA"
+
+    @staticmethod
+    def get_impl_cls() -> type["FlashInferCuteDSLMLAImpl"]:
+        return FlashInferCuteDSLMLAImpl
+
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        return capability.major == 10
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        reason = super().supports_combination(
+            head_size,
+            dtype,
+            kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            device_capability,
+        )
+        if reason is not None:
+            return reason
+
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        if vllm_config.model_config is None:
+            return None
+
+        hf_text_config = vllm_config.model_config.hf_text_config
+        qk_nope_head_dim = getattr(hf_text_config, "qk_nope_head_dim", 1)
+        kv_lora_rank = getattr(hf_text_config, "kv_lora_rank", 1)
+        qk_rope_head_dim = getattr(hf_text_config, "qk_rope_head_dim", 1)
+
+        if qk_nope_head_dim not in [64, 128]:
+            return (
+                "FlashInfer CuteDSL MLA requires qk_nope_head_dim in "
+                f"[64, 128], but got {qk_nope_head_dim}"
+            )
+        if kv_lora_rank not in [256, 512]:
+            return (
+                "FlashInfer CuteDSL MLA requires kv_lora_rank in "
+                f"[256, 512], but got {kv_lora_rank}"
+            )
+        if qk_rope_head_dim != 64:
+            return (
+                "FlashInfer CuteDSL MLA requires qk_rope_head_dim == 64, "
+                f"but got {qk_rope_head_dim}"
+            )
+        return None
+
+
+class FlashInferCuteDSLMLAImpl(FlashInferMLAImpl):
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        logits_soft_cap: float | None,
+        attn_type: str,
+        kv_sharing_target_layer_name: str | None,
+        **mla_args,
+    ) -> None:
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            kv_cache_dtype,
+            logits_soft_cap,
+            attn_type,
+            kv_sharing_target_layer_name,
+            **mla_args,
+        )
+        self._workspace_buffer = _get_fi_cutedsl_workspace()
+
+    def _get_decode_kwargs(self) -> dict[str, object]:
+        return {"backend": "cute-dsl"}

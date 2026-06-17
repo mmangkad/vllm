@@ -37,7 +37,13 @@ def temporary_environ(env_vars):
 model_backends_full_cudagraph = []
 
 # deepseek-ai/DeepSeek-V2-Lite with MLA
-MLA_backends = ["FlashMLA", "FlashAttentionMLA", "CutlassMLA"]
+MLA_backends = [
+    "FlashMLA",
+    "FlashAttentionMLA",
+    "CutlassMLA",
+    "FlashInferMLA",
+    "FlashInferCuteDSLMLA",
+]
 for mla_backend in MLA_backends:
     model_backends_full_cudagraph.append(
         ("deepseek-ai/DeepSeek-V2-Lite", backend_configs[mla_backend])
@@ -69,7 +75,7 @@ def llm_pair(request):
         if backend_config.specific_gpu_arch == (9, 0):
             pytest.skip("Only Hopper GPUs support FA3 and FlashMLA")
         elif backend_config.specific_gpu_arch == (10, 0):
-            pytest.skip("Only Blackwell GPUs support Cutlass MLA")
+            pytest.skip("Only Blackwell GPUs support this MLA backend")
 
     # FlashInfer is not supported on ROCm
     if backend_config == AttentionBackendEnum.FLASHINFER and current_platform.is_rocm():
