@@ -7,9 +7,9 @@ to ``../nvidia/model.py`` except for RMS normalization: FlashInfer's Gemma
 RMSNorm kernels are CUDA-only, so ``MiniMAXGemmaRMSNorm`` here uses a native
 (FlashInfer-free) implementation.
 
-The MiniMax-M3-preview config selects a single set of branches:
+The MiniMax-M3-preview config selects a small set of supported branches:
     * qk_norm_type == "per_head"
-    * hidden_act == "swigluoai"
+    * hidden_act in {"swigluoai", "silu"}
     * use_gemma_norm == True  -> Gemma-style RMSNorm everywhere
     * attention_output_gate == False
     * scoring_func == "sigmoid" with a routing-bias correction term
@@ -18,6 +18,7 @@ The MiniMax-M3-preview config selects a single set of branches:
 """
 
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch import nn
@@ -119,6 +120,20 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     return moe_layer_freq[layer_id] != 0
 
 
+def _get_minimax_m3_moe_act_kwargs(config: PretrainedConfig) -> dict[str, Any]:
+    hidden_act = config.hidden_act
+    if hidden_act in ("silu", "swigluoai"):
+        return {
+            "activation": "swigluoai_uninterleave",
+            "swiglu_limit": getattr(config, "swiglu_limit", 7.0),
+            "swiglu_alpha": getattr(config, "swiglu_alpha", 1.702),
+            "swiglu_beta": getattr(config, "swiglu_beta", 1.0),
+        }
+    raise ValueError(
+        f"Unsupported activation: {hidden_act}. Only silu and swigluoai are supported."
+    )
+
+
 def _build_rotary_emb(config: PretrainedConfig, head_dim: int):
     """Build the (partial NeoX) RoPE, honoring an optional ``rope_scaling`` config.
 
@@ -193,7 +208,7 @@ class MiniMAXGemmaRMSNorm(nn.Module):
 
 
 class MiniMaxM3MLP(nn.Module):
-    """Dense SwiGLU-OAI MLP (used by the leading dense layers)."""
+    """Dense gated MLP (used by the leading dense layers and shared experts)."""
 
     def __init__(
         self,
@@ -219,28 +234,35 @@ class MiniMaxM3MLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        if config.hidden_act != "swigluoai":
+        if config.hidden_act in ("silu", "swigluoai"):
+            self.act_fn = None
+            # gate * sigmoid(alpha * gate) * (up + beta), with both halves clamped.
+            # Some MiniMax-M3 configs report this activation as "silu" even
+            # though the inline expert math uses these MiniMax SwiGLU-OAI params.
+            # Kept as our fp32 Triton kernel (not the #22 SWIGLUOAI_UNINTERLEAVE op
+            # ``silu_and_mul_with_clamp``): that op IS built on ROCm but rounds
+            # intermediates to bf16 (rel ~3e-3 vs our fp32 ~1e-6), which costs gsm8k
+            # accuracy since this activation feeds the MXFP8 quant + MoE.
+            self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
+            self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
+            self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        else:
             raise ValueError(
                 f"Unsupported activation: {config.hidden_act}. "
-                "Only swigluoai is supported."
+                "Only silu and swigluoai are supported."
             )
-        # gate * sigmoid(alpha * gate) * (up + beta), with both halves clamped.
-        # Kept as our fp32 Triton kernel (not the #22 SWIGLUOAI_UNINTERLEAVE op
-        # ``silu_and_mul_with_clamp``): that op IS built on ROCm but rounds
-        # intermediates to bf16 (rel ~3e-3 vs our fp32 ~1e-6), which costs gsm8k
-        # accuracy since this activation feeds the MXFP8 quant + MoE.
-        self.swiglu_alpha = config.swiglu_alpha
-        self.swiglu_beta = config.swiglu_beta
-        self.swiglu_limit = config.swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x = swiglu_oai_split(
-            gate_up,
-            alpha=self.swiglu_alpha,
-            beta=self.swiglu_beta,
-            limit=self.swiglu_limit,
-        )
+        if self.act_fn is not None:
+            x = self.act_fn(gate_up)
+        else:
+            x = swiglu_oai_split(
+                gate_up,
+                alpha=self.swiglu_alpha,
+                beta=self.swiglu_beta,
+                limit=self.swiglu_limit,
+            )
         x, _ = self.down_proj(x)
         return x
 
@@ -308,10 +330,7 @@ class MiniMaxM3MoE(nn.Module):
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
             renormalize=True,
-            activation="swigluoai_uninterleave",
-            swiglu_limit=config.swiglu_limit,
-            swiglu_alpha=config.swiglu_alpha,
-            swiglu_beta=config.swiglu_beta,
+            **_get_minimax_m3_moe_act_kwargs(config),
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
@@ -814,14 +833,21 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Checkpoint experts use w1=gate, w2=down, w3=up.
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
-        )
+        expert_params_mapping = []
+        for gate_proj, down_proj, up_proj in [
+            ("w1", "w2", "w3"),
+            ("gate_proj", "down_proj", "up_proj"),
+        ]:
+            expert_params_mapping.extend(
+                fused_moe_make_expert_params_mapping(
+                    self,
+                    ckpt_gate_proj_name=gate_proj,
+                    ckpt_down_proj_name=down_proj,
+                    ckpt_up_proj_name=up_proj,
+                    num_experts=self.config.num_local_experts,
+                )
+            )
+        return expert_params_mapping
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # q/k/v_proj -> fused qkv_proj; gate_proj/up_proj -> fused gate_up_proj
@@ -999,10 +1025,18 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
+            "model.language_model.": "language_model.model.",
+            "model.vision_tower.": "vision_tower.",
+            "model.multi_modal_projector.": "vision_tower.multi_modal_projector.",
             "multi_modal_projector.": "vision_tower.multi_modal_projector.",
+            "model.patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
             "patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
+            "lm_head.": "language_model.lm_head.",
         },
         orig_to_new_substr={
+            ".mlp.experts.": ".block_sparse_moe.experts.",
+            ".mlp.gate.": ".block_sparse_moe.gate.",
+            ".mlp.shared_experts.": ".block_sparse_moe.shared_experts.",
             ".mlp.fc1": ".fc1",
             ".mlp.fc2": ".fc2",
         },

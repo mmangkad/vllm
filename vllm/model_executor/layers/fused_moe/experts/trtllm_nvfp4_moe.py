@@ -66,8 +66,28 @@ class TrtLlmNvFp4ExpertsBase:
         else:
             self.g1_scale_c = self.quant_config.a2_gscale.clone()
 
+        device = torch.accelerator.current_device_index()
+        if moe_config.is_act_and_mul and quant_config.gemm1_alpha is not None:
+            self.gemm1_alpha = torch.full(
+                (self.local_num_experts,),
+                quant_config.gemm1_alpha,
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            self.gemm1_alpha = None
+
+        if moe_config.is_act_and_mul and quant_config.gemm1_beta is not None:
+            self.gemm1_beta = torch.full(
+                (self.local_num_experts,),
+                quant_config.gemm1_beta,
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            self.gemm1_beta = None
+
         if moe_config.is_act_and_mul and quant_config.gemm1_clamp_limit is not None:
-            device = torch.accelerator.current_device_index()
             self.gemm1_clamp_limit = torch.full(
                 (self.local_num_experts,),
                 quant_config.gemm1_clamp_limit,
@@ -95,12 +115,20 @@ class TrtLlmNvFp4ExpertsBase:
         )
         self.g1_scale_c = layer.g1_scale_c
 
-        # Pre-fold the per-expert g1_alphas (= output1_scale_gate_scalar)
-        # division so the TRTLLM kernel receives the raw-GEMM-space clamp
-        # directly. g1_alphas is set once here in process_weights_after_loading
-        # (via the in-place mul above) and never changes again, so this is a
-        # static, per-expert constant. Register on the layer so EPLB
-        # rearranges it alongside the other expert tensors.
+        # Pre-fold the per-expert g1_alphas division so the TRTLLM
+        # fused activation receives raw-GEMM-space beta/clamp values.
+        # g1_alphas is set once here in process_weights_after_loading
+        # (via the in-place mul above) and never changes again, so these are
+        # static, per-expert constants. Register on the layer so EPLB
+        # rearranges them alongside the other expert tensors.
+        if self.gemm1_beta is not None:
+            gemm1_beta = self.gemm1_beta / self.quant_config.g1_alphas
+            layer.register_parameter(
+                "gemm1_beta",
+                torch.nn.Parameter(gemm1_beta, requires_grad=False),
+            )
+            self.gemm1_beta = layer.gemm1_beta
+
         if self.gemm1_clamp_limit is not None:
             gemm1_clamp_limit = self.gemm1_clamp_limit / self.quant_config.g1_alphas
             layer.register_parameter(
@@ -140,6 +168,7 @@ class TrtLlmNvFp4ExpertsBase:
         """Supports only SiLU, RELU^2 non-gated and GELU activation."""
         return activation in [
             MoEActivation.SILU,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             MoEActivation.RELU2_NO_MUL,
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
@@ -248,8 +277,8 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_beta=self.gemm1_beta,
             gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
@@ -409,8 +438,8 @@ class TrtLlmNvFp4ExpertsMonolithic(
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_beta=self.gemm1_beta,
             gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),

@@ -95,6 +95,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         self.use_deepseek_fp8_block_scale = quant_config.is_block_quantized
         self.max_capture_size = moe_config.max_capture_size
         self.gemm1_clamp_limit: torch.Tensor | None = None
+        self.gemm1_alpha: torch.Tensor | None = None
+        self.gemm1_beta: torch.Tensor | None = None
         if quant_config.gemm1_clamp_limit is not None:
             self.gemm1_clamp_limit = torch.tensor(
                 [quant_config.gemm1_clamp_limit] * self.num_experts,
@@ -102,7 +104,35 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                 device=self.device,
             )
 
-        if quant_config.weight_quant_dtype == "mxfp4":
+        if quant_config.gemm1_alpha is not None or quant_config.gemm1_beta is not None:
+            if quant_config.gemm1_alpha is not None and self.gemm1_clamp_limit is None:
+                raise ValueError("gemm1_alpha requires gemm1_clamp_limit")
+            self.gemm1_alpha = torch.tensor(
+                [
+                    (
+                        quant_config.gemm1_alpha
+                        if quant_config.gemm1_alpha is not None
+                        else 1.0
+                    )
+                ]
+                * self.num_experts,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.gemm1_beta = torch.tensor(
+                [
+                    (
+                        quant_config.gemm1_beta
+                        if quant_config.gemm1_beta is not None
+                        else 0.0
+                    )
+                ]
+                * self.num_experts,
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        elif quant_config.weight_quant_dtype == "mxfp4":
             # This value is used specifically for gpt-oss,
             # Need to revisit this for other models
             self.gemm1_alpha = torch.tensor(
@@ -191,6 +221,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             MoEActivation.GELU_TANH,
             MoEActivation.RELU2_NO_MUL,
             MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
         ]
 
     @staticmethod
@@ -270,6 +301,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             MoEActivation.SILU: ActivationType.Swiglu,  # This is the default
             MoEActivation.GELU_TANH: ActivationType.Geglu,
             MoEActivation.SWIGLUOAI: ActivationType.Swiglu,  # gpt-oss alias
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE: ActivationType.Swiglu,
             MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
         }
         assert activation in activation_str_to_value_map, (
@@ -322,6 +354,13 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             # FlashInfer API requires weight to be long for nvfp4
             fc1_expert_weights = w1.view(torch.long)
             fc2_expert_weights = w2.view(torch.long)
+            if activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+                assert self.gemm1_alpha is not None
+                assert self.gemm1_beta is not None
+                assert self.gemm1_clamp_limit is not None
+                swiglu_alpha = self.gemm1_alpha
+                swiglu_beta = self.gemm1_beta
+                swiglu_limit = self.gemm1_clamp_limit
         elif self.weight_quant_dtype == "mxfp4":
             assert self.w1_scale is not None and self.w2_scale is not None
             assert w1.is_contiguous() and w2.is_contiguous()
