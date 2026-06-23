@@ -138,7 +138,7 @@ class MiniMAXGemmaRMSNorm(nn.Module):
 
 
 class MiniMaxM3MLP(nn.Module):
-    """Dense gated MLP (used by the leading dense layers and shared experts)."""
+    """Dense SwiGLU-OAI MLP (used by the leading dense layers)."""
 
     def __init__(
         self,
@@ -173,7 +173,7 @@ class MiniMaxM3MLP(nn.Module):
         self.act_fn = SiluAndMulWithClamp(
             swiglu_limit=config.swiglu_limit,
             alpha=config.swiglu_alpha,
-            beta=getattr(config, "swiglu_beta", 1.0),
+            beta=config.swiglu_beta,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -252,7 +252,7 @@ class MiniMaxM3MoE(nn.Module):
             activation="swigluoai_uninterleave",
             swiglu_limit=config.swiglu_limit,
             swiglu_alpha=config.swiglu_alpha,
-            swiglu_beta=getattr(config, "swiglu_beta", 1.0),
+            swiglu_beta=config.swiglu_beta,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,

@@ -193,7 +193,7 @@ class MiniMAXGemmaRMSNorm(nn.Module):
 
 
 class MiniMaxM3MLP(nn.Module):
-    """Dense gated MLP (used by the leading dense layers and shared experts)."""
+    """Dense SwiGLU-OAI MLP (used by the leading dense layers)."""
 
     def __init__(
         self,
@@ -230,7 +230,7 @@ class MiniMaxM3MLP(nn.Module):
         # intermediates to bf16 (rel ~3e-3 vs our fp32 ~1e-6), which costs gsm8k
         # accuracy since this activation feeds the MXFP8 quant + MoE.
         self.swiglu_alpha = config.swiglu_alpha
-        self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
+        self.swiglu_beta = config.swiglu_beta
         self.swiglu_limit = config.swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -311,7 +311,7 @@ class MiniMaxM3MoE(nn.Module):
             activation="swigluoai_uninterleave",
             swiglu_limit=config.swiglu_limit,
             swiglu_alpha=config.swiglu_alpha,
-            swiglu_beta=getattr(config, "swiglu_beta", 1.0),
+            swiglu_beta=config.swiglu_beta,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
