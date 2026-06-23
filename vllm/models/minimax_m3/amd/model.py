@@ -7,9 +7,9 @@ to ``../nvidia/model.py`` except for RMS normalization: FlashInfer's Gemma
 RMSNorm kernels are CUDA-only, so ``MiniMAXGemmaRMSNorm`` here uses a native
 (FlashInfer-free) implementation.
 
-The MiniMax-M3-preview config selects a small set of supported branches:
+The MiniMax-M3-preview config selects a single set of branches:
     * qk_norm_type == "per_head"
-    * hidden_act in {"swigluoai", "silu"}
+    * hidden_act == "swigluoai"
     * use_gemma_norm == True  -> Gemma-style RMSNorm everywhere
     * attention_output_gate == False
     * scoring_func == "sigmoid" with a routing-bias correction term
@@ -18,7 +18,6 @@ The MiniMax-M3-preview config selects a small set of supported branches:
 """
 
 from collections.abc import Iterable
-from typing import Any
 
 import torch
 from torch import nn
@@ -118,20 +117,6 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
-
-
-def _get_minimax_m3_moe_act_kwargs(config: PretrainedConfig) -> dict[str, Any]:
-    hidden_act = config.hidden_act
-    if hidden_act in ("silu", "swigluoai"):
-        return {
-            "activation": "swigluoai_uninterleave",
-            "swiglu_limit": getattr(config, "swiglu_limit", 7.0),
-            "swiglu_alpha": getattr(config, "swiglu_alpha", 1.702),
-            "swiglu_beta": getattr(config, "swiglu_beta", 1.0),
-        }
-    raise ValueError(
-        f"Unsupported activation: {hidden_act}. Only silu and swigluoai are supported."
-    )
 
 
 def _build_rotary_emb(config: PretrainedConfig, head_dim: int):
@@ -234,35 +219,28 @@ class MiniMaxM3MLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        if config.hidden_act in ("silu", "swigluoai"):
-            self.act_fn = None
-            # gate * sigmoid(alpha * gate) * (up + beta), with both halves clamped.
-            # Some MiniMax-M3 configs report this activation as "silu" even
-            # though the inline expert math uses these MiniMax SwiGLU-OAI params.
-            # Kept as our fp32 Triton kernel (not the #22 SWIGLUOAI_UNINTERLEAVE op
-            # ``silu_and_mul_with_clamp``): that op IS built on ROCm but rounds
-            # intermediates to bf16 (rel ~3e-3 vs our fp32 ~1e-6), which costs gsm8k
-            # accuracy since this activation feeds the MXFP8 quant + MoE.
-            self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
-            self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
-            self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
-        else:
+        if config.hidden_act != "swigluoai":
             raise ValueError(
                 f"Unsupported activation: {config.hidden_act}. "
-                "Only silu and swigluoai are supported."
+                "Only swigluoai is supported."
             )
+        # gate * sigmoid(alpha * gate) * (up + beta), with both halves clamped.
+        # Kept as our fp32 Triton kernel (not the #22 SWIGLUOAI_UNINTERLEAVE op
+        # ``silu_and_mul_with_clamp``): that op IS built on ROCm but rounds
+        # intermediates to bf16 (rel ~3e-3 vs our fp32 ~1e-6), which costs gsm8k
+        # accuracy since this activation feeds the MXFP8 quant + MoE.
+        self.swiglu_alpha = config.swiglu_alpha
+        self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
+        self.swiglu_limit = config.swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        if self.act_fn is not None:
-            x = self.act_fn(gate_up)
-        else:
-            x = swiglu_oai_split(
-                gate_up,
-                alpha=self.swiglu_alpha,
-                beta=self.swiglu_beta,
-                limit=self.swiglu_limit,
-            )
+        x = swiglu_oai_split(
+            gate_up,
+            alpha=self.swiglu_alpha,
+            beta=self.swiglu_beta,
+            limit=self.swiglu_limit,
+        )
         x, _ = self.down_proj(x)
         return x
 
@@ -330,7 +308,10 @@ class MiniMaxM3MoE(nn.Module):
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
             renormalize=True,
-            **_get_minimax_m3_moe_act_kwargs(config),
+            activation="swigluoai_uninterleave",
+            swiglu_limit=config.swiglu_limit,
+            swiglu_alpha=config.swiglu_alpha,
+            swiglu_beta=getattr(config, "swiglu_beta", 1.0),
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,

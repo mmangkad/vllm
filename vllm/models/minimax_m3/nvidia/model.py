@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only MiniMax M3 (text backbone) model.
 
-The MiniMax-M3-preview config selects a small set of supported branches:
+The MiniMax-M3-preview config selects a single set of branches:
     * qk_norm_type == "per_head"
-    * hidden_act in {"swigluoai", "silu"}
+    * hidden_act == "swigluoai"
     * use_gemma_norm == True  -> Gemma-style RMSNorm everywhere
     * attention_output_gate == False
     * scoring_func == "sigmoid" with a routing-bias correction term
@@ -13,7 +13,6 @@ The MiniMax-M3-preview config selects a small set of supported branches:
 """
 
 from collections.abc import Iterable
-from typing import Any
 
 import torch
 from torch import nn
@@ -107,38 +106,6 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     return moe_layer_freq[layer_id] != 0
 
 
-def _get_minimax_m3_dense_act_fn(config: PretrainedConfig) -> nn.Module:
-    hidden_act = config.hidden_act
-    if hidden_act in ("silu", "swigluoai"):
-        return SiluAndMulWithClamp(
-            swiglu_limit=getattr(config, "swiglu_limit", 7.0),
-            alpha=getattr(config, "swiglu_alpha", 1.702),
-            beta=getattr(config, "swiglu_beta", 1.0),
-        )
-    raise ValueError(
-        f"Unsupported activation: {hidden_act}. Only silu and swigluoai are supported."
-    )
-
-
-def _get_minimax_m3_moe_act_kwargs(config: PretrainedConfig) -> dict[str, Any]:
-    hidden_act = config.hidden_act
-    if hidden_act in ("silu", "swigluoai"):
-        # w13 (gate_up_proj) is loaded packed via MergedColumnParallelLinear
-        # ([all gates; all ups]), so use the uninterleaved SwiGLU-OAI variant
-        # rather than the interleaved gpt-oss layout.
-        # Some MiniMax-M3 configs report this activation as "silu" even though
-        # the inline expert math uses the MiniMax SwiGLU-OAI alpha/beta/limit.
-        return {
-            "activation": "swigluoai_uninterleave",
-            "swiglu_limit": getattr(config, "swiglu_limit", 7.0),
-            "swiglu_alpha": getattr(config, "swiglu_alpha", 1.702),
-            "swiglu_beta": getattr(config, "swiglu_beta", 1.0),
-        }
-    raise ValueError(
-        f"Unsupported activation: {hidden_act}. Only silu and swigluoai are supported."
-    )
-
-
 class MiniMAXGemmaRMSNorm(nn.Module):
     """Gemma-style RMS normalization backed by FlashInfer kernels.
 
@@ -197,7 +164,17 @@ class MiniMaxM3MLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        self.act_fn = _get_minimax_m3_dense_act_fn(config)
+        if config.hidden_act != "swigluoai":
+            raise ValueError(
+                f"Unsupported activation: {config.hidden_act}. "
+                "Only swigluoai is supported."
+            )
+        # gate * sigmoid(alpha * gate) * (up + beta), with both halves clamped.
+        self.act_fn = SiluAndMulWithClamp(
+            swiglu_limit=config.swiglu_limit,
+            alpha=config.swiglu_alpha,
+            beta=getattr(config, "swiglu_beta", 1.0),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
@@ -269,7 +246,13 @@ class MiniMaxM3MoE(nn.Module):
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
             renormalize=True,
-            **_get_minimax_m3_moe_act_kwargs(config),
+            # w13 (gate_up_proj) is loaded packed via MergedColumnParallelLinear
+            # ([all gates; all ups]), so use the uninterleaved SwiGLU-OAI variant
+            # rather than the interleaved gpt-oss layout.
+            activation="swigluoai_uninterleave",
+            swiglu_limit=config.swiglu_limit,
+            swiglu_alpha=config.swiglu_alpha,
+            swiglu_beta=getattr(config, "swiglu_beta", 1.0),
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
