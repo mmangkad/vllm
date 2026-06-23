@@ -1007,14 +1007,26 @@ class MiniMaxM3SparseForConditionalGeneration(
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.language_model.": "language_model.model.",
+            "model.vision_tower.embeddings.": ("vision_tower.vision_model.embeddings."),
+            "model.vision_tower.layers.": "vision_tower.vision_model.encoder.layers.",
+            "model.vision_tower.pre_layrnorm.": (
+                "vision_tower.vision_model.pre_layrnorm."
+            ),
             "model.vision_tower.": "vision_tower.",
             "model.multi_modal_projector.": "vision_tower.multi_modal_projector.",
-            "multi_modal_projector.": "vision_tower.multi_modal_projector.",
             "model.patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
+            "multi_modal_projector.": "vision_tower.multi_modal_projector.",
             "patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
             "lm_head.": "language_model.lm_head.",
         },
         orig_to_new_substr={
+            "model.multi_modal_projector.merge_linear_1.": (
+                "model.patch_merge_mlp.linear_1."
+            ),
+            "model.multi_modal_projector.merge_linear_2.": (
+                "model.patch_merge_mlp.linear_2."
+            ),
+            ".embeddings.proj.": ".embeddings.patch_embedding.",
             ".mlp.experts.": ".block_sparse_moe.experts.",
             ".mlp.gate.": ".block_sparse_moe.gate.",
             ".mlp.shared_experts.": ".block_sparse_moe.shared_experts.",
