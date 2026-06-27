@@ -492,7 +492,8 @@ def main():
     parser.add_argument(
         "--prefill-backends",
         nargs="+",
-        help="Prefill backends to compare (fa2, fa3, fa4). "
+        help="Prefill backends to compare (flash_attn, fa2, fa3, fa4, "
+        "flashinfer, trtllm, tokenspeed). "
         "Uses the first decode backend for impl construction.",
     )
     parser.add_argument(
@@ -1109,6 +1110,9 @@ def main():
             "ncu_profile": args.ncu_profile,
             "warmup_ms": args.warmup_ms,
             "num_splits": args.num_splits,
+            "kv_lora_rank": args.kv_lora_rank,
+            "qk_nope_head_dim": args.qk_nope_head_dim,
+            "qk_rope_head_dim": args.qk_rope_head_dim,
         }
         all_results = run_parameter_sweep(
             backends, args.batch_specs, base_config_args, args.parameter_sweep, console
@@ -1143,6 +1147,9 @@ def main():
                             ncu_profile=args.ncu_profile,
                             warmup_ms=args.warmup_ms,
                             num_splits=args.num_splits,
+                            kv_lora_rank=args.kv_lora_rank,
+                            qk_nope_head_dim=args.qk_nope_head_dim,
+                            qk_rope_head_dim=args.qk_rope_head_dim,
                         )
 
                         result = run_benchmark(config)
@@ -1179,13 +1186,21 @@ def main():
                             batch_spec=spec,
                             num_layers=args.num_layers,
                             head_dim=args.head_dim,
+                            v_head_dim=getattr(args, "v_head_dim", None),
                             num_q_heads=args.num_q_heads,
                             num_kv_heads=args.num_kv_heads,
                             block_size=args.block_size,
                             device=args.device,
                             profile_memory=args.profile_memory,
+                            kv_cache_dtype=args.kv_cache_dtype,
+                            use_cuda_graphs=args.cuda_graphs,
+                            ncu_profile=args.ncu_profile,
                             warmup_ms=args.warmup_ms,
+                            num_splits=args.num_splits,
                             prefill_backend=pb,
+                            kv_lora_rank=args.kv_lora_rank,
+                            qk_nope_head_dim=args.qk_nope_head_dim,
+                            qk_rope_head_dim=args.qk_rope_head_dim,
                         )
 
                         result = run_benchmark(config)

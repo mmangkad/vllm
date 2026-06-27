@@ -562,7 +562,9 @@ def parse_mla_prefill_backends() -> list[dict[str, Any]]:
         if supported_mla_dimensions:
             notes = " or ".join(supported_mla_dimensions) + " only"
         elif backend_name == "FLASH_ATTN":
-            notes = "FA4 on SM100+, FA3 on SM90, FA2 otherwise"
+            notes = (
+                "FA4 on SM100+ when supported by head dims, FA3 on SM90, FA2 otherwise"
+            )
 
         prefill_backends.append(
             {

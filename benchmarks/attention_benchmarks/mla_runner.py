@@ -203,6 +203,10 @@ def create_minimal_vllm_config(
 # FA backends set flash_attn_version and disable non-FA paths.
 # Non-FA backends enable their specific path and disable others.
 _PREFILL_BACKEND_CONFIG: dict[str, dict] = {
+    "flash_attn": {
+        "flash_attn_version": None,
+        "mla_prefill_backend": MLAPrefillBackendEnum.FLASH_ATTN,
+    },
     "fa2": {
         "flash_attn_version": 2,
         "mla_prefill_backend": MLAPrefillBackendEnum.FLASH_ATTN,
@@ -1011,6 +1015,7 @@ def _run_mla_benchmark_batched(
         # check the resolved class against the requested name as a sanity guard.
         if prefill_backend is not None:
             expected_class = {
+                "flash_attn": "FlashAttnPrefillBackend",
                 "fa2": "FlashAttnPrefillBackend",
                 "fa3": "FlashAttnPrefillBackend",
                 "fa4": "FlashAttnPrefillBackend",
