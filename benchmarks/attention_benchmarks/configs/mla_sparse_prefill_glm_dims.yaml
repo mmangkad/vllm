@@ -1,0 +1,68 @@
+# MLA sparse prefill benchmark configuration for GLM-5.2 dimensions.
+#
+# GLM-5.2 is a sparse/DSA MLA model. In vLLM serving on Blackwell, it selects
+# FLASHINFER_MLA_SPARSE as the attention backend and FLASH_ATTN as the separate
+# MLA prefill backend, with FlashAttention resolving to FA2 for qk_head_dim=256.
+#
+# This config mirrors configs/mla_sparse_prefill.yaml's workload sweep, but uses
+# GLM-5.2 dimensions and the serving-default sparse MLA backend.
+#
+# Usage:
+#   python benchmark.py --config configs/mla_sparse_prefill_glm_dims.yaml
+
+description: "GLM-5.2 sparse MLA prefill benchmark"
+
+model:
+  name: "glm-5.2"
+  num_layers: 78
+  num_q_heads: 64
+  num_kv_heads: 1
+  head_dim: 576
+  kv_lora_rank: 512
+  qk_nope_head_dim: 192
+  qk_rope_head_dim: 64
+  v_head_dim: 256
+  block_size: 128
+
+batch_specs:
+  # Pure prefill
+  - "1q512"
+  - "1q1k"
+  - "1q2k"
+  - "1q4k"
+  - "1q8k"
+
+  # Batched pure prefill
+  - "2q512"
+  - "2q1k"
+  - "2q2k"
+  - "2q4k"
+  - "2q8k"
+  - "4q512"
+  - "4q1k"
+  - "4q2k"
+  - "4q4k"
+  - "4q8k"
+  - "8q512"
+  - "8q1k"
+  - "8q2k"
+  - "8q4k"
+  - "8q8k"
+
+  # Extend
+  - "1q512s4k"
+  - "1q512s8k"
+  - "1q1ks8k"
+  - "1q2ks8k"
+  - "1q2ks16k"
+  - "1q4ks16k"
+
+backends:
+  - FLASHINFER_MLA_SPARSE
+
+device: "cuda:0"
+profile_memory: true
+cuda_graphs: true
+
+output:
+  csv: "/tmp/mla_sparse_prefill_flashinfer_glm_dims.csv"
