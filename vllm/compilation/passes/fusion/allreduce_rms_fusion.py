@@ -66,9 +66,6 @@ def _norm_input_weight_dtype_match(match: pm.Match) -> bool:
     return True
 
 
-# The empirical value for small batch
-PDL_ADVANCE_LAUNCH_TOKENS = 16
-
 logger = init_logger(__name__)
 
 flashinfer_comm: ModuleType | None = None
@@ -108,28 +105,6 @@ FI_ALLREDUCE_FUSION_MAX_SIZE_MB: dict[int, dict[int, float]] = {
     },
 }
 
-# Max size of the input tensor per world size per device capability
-# to use flashinfer one shot fused allreduce
-# OneShot max size is at most 64MB / world size (FlashInfer restriction)
-_FI_ALLREDUCE_ONE_SHOT_MAX_SIZES_MB: dict[int, dict[int, float]] = {
-    90: {
-        2: 32,  # 32MB
-        4: 2,  # 2MB
-        8: 0.5,  # 0.5MB
-    },
-    100: {
-        2: 32,  # 32MB
-        4: 4,  # 4MB
-        8: 1,  # 1MB
-    },
-    103: {
-        2: 32,  # 32MB
-        4: 4,  # 4MB
-        8: 2,  # 2MB
-    },
-}
-
-
 if flashinfer_comm is not None:
     from vllm.distributed.device_communicators.flashinfer_all_reduce import (
         destroy_fi_ar_workspace,
@@ -138,8 +113,6 @@ if flashinfer_comm is not None:
     )
 
     ar_fusion_patterns = flashinfer_comm.AllReduceFusionPattern
-
-    MiB = 1024 * 1024
 
     def call_trtllm_fused_allreduce_norm(
         allreduce_in: torch.Tensor,
@@ -173,19 +146,6 @@ if flashinfer_comm is not None:
             f"max token num {max_token_num} * hidden size {hidden_size} * "
             f"element size {element_size}"
         )
-        curr_device = current_platform.get_device_capability()
-        device_capability = curr_device.to_int() if curr_device is not None else None
-        # Get one shot input size limit for the current world size
-        # for the current device capability
-        max_one_shot_size = _FI_ALLREDUCE_ONE_SHOT_MAX_SIZES_MB.get(
-            device_capability,  # type: ignore[arg-type, unused-ignore]
-            {},
-        ).get(world_size, None)
-        # Use one shot if no max size is specified
-        use_oneshot = (
-            max_one_shot_size is None or current_tensor_size <= max_one_shot_size * MiB
-        )
-
         # Select workspace based on pattern: quant patterns use the
         # trtllm quant workspace, non-quant patterns use the primary workspace.
         is_quant_pattern = pattern_code in (
@@ -207,6 +167,12 @@ if flashinfer_comm is not None:
             "Flashinfer allreduce workspace must be initialized when using flashinfer"
         )
         assert flashinfer_comm is not None
+        use_oneshot: bool | None = None
+        if workspace.backend == "trtllm" and world_size not in (2, 4, 8):
+            # FlashInfer 0.6.13's TRT-LLM auto heuristic only covers TP 2/4/8.
+            # Preserve the previous vLLM fallback for larger TRT-LLM groups
+            # instead of letting use_oneshot=None hit a KeyError.
+            use_oneshot = True
         if norm_out is None:
             norm_out = allreduce_in
             residual_out = residual
@@ -222,7 +188,7 @@ if flashinfer_comm is not None:
             # in vllm we only support swizzled layout
             layout_code = flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4
 
-        flashinfer_comm.allreduce_fusion(
+        allreduce_kwargs = dict(
             input=allreduce_in,
             workspace=workspace,
             pattern=pattern_code,
@@ -237,21 +203,16 @@ if flashinfer_comm is not None:
             rms_eps=rms_eps,
             scale_factor=scale_factor,
             layout_code=layout_code,
-            use_oneshot=use_oneshot,
             fp32_acc=fp32_acc,
             weight_bias=weight_bias,
-            # The one-shot Lamport all-reduce signals PDL completion before its
-            # output buffer is committed when trigger_completion_at_end is
-            # False, so the next PDL-launched kernel can read the uninitialized
-            # Lamport buffer and produce NaN. This only fires for
-            # num_tokens <= PDL_ADVANCE_LAUNCH_TOKENS (the batch=1 / spec-decode
-            # shapes, where the one-shot path is always selected). Complete at
-            # the end for the one-shot path; the two-shot path is synchronized
-            # and keeps the early completion. Related one-shot instability in
-            # the same kernel: flashinfer-ai/flashinfer#1223.
-            trigger_completion_at_end=use_oneshot
-            or num_tokens > PDL_ADVANCE_LAUNCH_TOKENS,
         )
+        if use_oneshot is not None:
+            allreduce_kwargs["use_oneshot"] = use_oneshot
+        # Otherwise rely on FlashInfer defaults: use_oneshot=None selects the
+        # backend strategy, and trigger_completion_at_end=True keeps PDL
+        # completion safe for one-shot Lamport buffers. See PR #45448 and
+        # flashinfer-ai/flashinfer#1223.
+        flashinfer_comm.allreduce_fusion(**allreduce_kwargs)
 
     def call_trtllm_fused_allreduce_norm_fake(
         allreduce_in: torch.Tensor,
