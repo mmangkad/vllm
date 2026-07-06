@@ -171,7 +171,7 @@ class HYV3MoEFused(nn.Module):
                 intermediate_size=config.expert_hidden_dim * config.num_shared_experts,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=f"{prefix}",
+                prefix=f"{prefix}.shared_experts",
                 reduce_results=False,
             )
         else:
@@ -572,6 +572,9 @@ class HYV3Model(nn.Module, MixtureOfExperts):
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
+            name = name.replace(".shared_experts.", ".shared_mlp.").replace(
+                ".e_score_correction_bias", ".expert_bias"
+            )
             if "scale" in name:
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)

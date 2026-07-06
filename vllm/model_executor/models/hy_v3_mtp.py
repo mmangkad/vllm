@@ -79,7 +79,10 @@ class HYV3SharedHead(nn.Module):
     ) -> None:
         super().__init__()
         self.head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix="lm_head",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -349,6 +352,11 @@ class HYV3MTP(nn.Module):
             # Skip weights that _rewrite_spec_layer_name marked for skipping
             if name == "__skip__":
                 continue
+            # Current MTP exports use shared_mlp/expert_bias directly, but keep
+            # the main-layer aliases for checkpoints that mirror layer naming.
+            name = name.replace(".shared_experts.", ".shared_mlp.").replace(
+                ".e_score_correction_bias", ".expert_bias"
+            )
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
