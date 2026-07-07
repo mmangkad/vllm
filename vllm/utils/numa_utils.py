@@ -16,8 +16,6 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-import psutil
-
 from vllm import envs
 
 if TYPE_CHECKING:
@@ -66,20 +64,6 @@ def _is_auto_numa_available() -> bool:
     if not os.path.isdir("/sys/devices/system/node/node1"):
         return False
 
-    try:
-        process = psutil.Process(os.getpid())
-        cpu_affinity = process.cpu_affinity()
-        cpu_count = psutil.cpu_count()
-        if cpu_count is not None and cpu_affinity != list(range(cpu_count)):
-            logger.warning(
-                "CPU affinity is already constrained for this process. "
-                "Skipping automatic NUMA binding; pass --numa-bind-nodes "
-                "explicitly to override."
-            )
-            return False
-    except (AttributeError, NotImplementedError, psutil.Error):
-        pass
-
     if not _can_set_mempolicy():
         logger.warning(
             "User lacks permission to set NUMA memory policy. "
@@ -120,7 +104,7 @@ def get_auto_numa_nodes() -> list[int] | None:
 #     unprivileged sysfs path. The official interface
 #     (/dev/isst_interface, used by `intel-speed-select`) is root-only,
 #     which is a non-starter in most production deployments (shared
-#     clusters, prebuilt containers, managed cloud).
+#     clusters, restricted runtimes, managed cloud).
 #   * Even recent stable kernels (e.g. 6.14, March 2025) do not yet
 #     preferentially schedule work on PCT priority cores, so vLLM cannot
 #     just "let the scheduler handle it".
@@ -162,6 +146,13 @@ class _PctSku(NamedTuple):
 
     highest_perf: int
     priority_stride: int
+
+
+class _CpuBinding(NamedTuple):
+    """CPU-binding decision for a NUMA target."""
+
+    cpu_list: str | None
+    use_cpunodebind: bool
 
 
 _PCT_CAPABLE_SKUS: dict[str, _PctSku] = {
@@ -289,24 +280,14 @@ def _maybe_get_pct_cpu_binding(numa_nodes: list[int]) -> list[int] | None:
     if sku is None:
         return None
 
-    from vllm.utils.cpu_resource_utils import parse_id_list
-
     stride = sku.priority_stride
     union_cpus: set[int] = set()
     for numa_node in numa_nodes:
-        cpulist_path = Path(f"/sys/devices/system/node/node{numa_node}/cpulist")
-        try:
-            cpulist_raw = cpulist_path.read_text().strip()
-        except OSError:
-            continue
-        if not cpulist_raw:
-            continue
-        try:
-            node_cpus = parse_id_list(cpulist_raw)
-        except ValueError:
+        node_cpus = _node_cpus(numa_node)
+        if not node_cpus:
             continue
 
-        priority = [cpu for cpu in node_cpus if cpu % stride in (0, 1)]
+        priority = sorted(cpu for cpu in node_cpus if cpu % stride in (0, 1))
         if not priority:
             continue
         union_cpus.update(priority)
@@ -323,16 +304,87 @@ def _maybe_get_pct_cpu_binding(numa_nodes: list[int]) -> list[int] | None:
     return sorted(union_cpus)
 
 
-def _get_cpu_binding(
-    parallel_config, gpu_index: int, numa_nodes: list[int]
-) -> str | None:
-    """Return the CPU list a process should be pinned to (or None)."""
+def _node_cpus(numa_node: int) -> set[int]:
+    """Return CPUs belonging to a NUMA node, or an empty set if unavailable."""
+    from vllm.utils.cpu_resource_utils import parse_id_list
+
+    cpulist_path = Path(f"/sys/devices/system/node/node{numa_node}/cpulist")
+    try:
+        cpulist_raw = cpulist_path.read_text().strip()
+    except OSError:
+        return set()
+    if not cpulist_raw:
+        return set()
+    try:
+        return set(parse_id_list(cpulist_raw))
+    except ValueError:
+        return set()
+
+
+def _intersect_allowed_cpus(cpus: list[int] | set[int]) -> list[int] | None:
+    """Intersect target CPUs with the current process CPU set.
+
+    vLLM may be started with a constrained ``cpus_allowed`` mask. ``numactl
+    --physcpubind`` rejects CPUs outside that mask, so automatic CPU selections
+    must be reduced before spawning workers.
+    """
+    try:
+        target = set(cpus) & os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        target = set(cpus)
+    if not target:
+        return None
+    return sorted(target)
+
+
+def _log_empty_cpu_intersection(numa_nodes: list[int], cpu_kind: str) -> None:
+    try:
+        allowed_cpus = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        allowed_cpus = []
+    logger.warning(
+        "%s CPUs for NUMA nodes %s have no CPUs allowed by the current "
+        "process affinity %s; skipping CPU binding and keeping memory binding.",
+        cpu_kind,
+        numa_nodes,
+        allowed_cpus,
+    )
+
+
+def _get_auto_cpu_binding(numa_nodes: list[int]) -> _CpuBinding:
+    pct_cpus = _maybe_get_pct_cpu_binding(numa_nodes)
+    if pct_cpus is not None:
+        target_cpus = _intersect_allowed_cpus(pct_cpus)
+        if target_cpus is not None:
+            return _CpuBinding(
+                cpu_list=",".join(str(c) for c in target_cpus),
+                use_cpunodebind=False,
+            )
+        _log_empty_cpu_intersection(numa_nodes, "PCT priority")
+
+    node_cpus: set[int] = set()
+    for numa_node in numa_nodes:
+        node_cpus.update(_node_cpus(numa_node))
+    if not node_cpus:
+        return _CpuBinding(cpu_list=None, use_cpunodebind=True)
+
+    target_cpus = _intersect_allowed_cpus(node_cpus)
+    if target_cpus is None:
+        _log_empty_cpu_intersection(numa_nodes, "NUMA node")
+        return _CpuBinding(cpu_list=None, use_cpunodebind=False)
+    if target_cpus == sorted(node_cpus):
+        return _CpuBinding(cpu_list=None, use_cpunodebind=True)
+    return _CpuBinding(
+        cpu_list=",".join(str(c) for c in target_cpus),
+        use_cpunodebind=False,
+    )
+
+
+def _get_cpu_binding(parallel_config, gpu_index: int) -> str | None:
+    """Return the explicit per-GPU CPU list, if the user configured one."""
     cpu_bindings = parallel_config.numa_bind_cpus
     if cpu_bindings is None:
-        pct_cpus = _maybe_get_pct_cpu_binding(numa_nodes)
-        if pct_cpus is None:
-            return None
-        return ",".join(str(c) for c in pct_cpus)
+        return None
 
     if gpu_index >= len(cpu_bindings):
         raise ValueError(
@@ -348,17 +400,35 @@ def _get_numactl_worker_args(
     """Compute the numactl args for a single TP/PP worker subprocess."""
     gpu_index = _get_gpu_index(parallel_config, local_rank, dp_local_rank)
     numa_node = _get_numa_node(parallel_config, gpu_index)
-    cpu_binding = _get_cpu_binding(parallel_config, gpu_index, [numa_node])
+    numa_nodes = [numa_node]
+    binding = (
+        _CpuBinding(
+            cpu_list=_get_cpu_binding(parallel_config, gpu_index),
+            use_cpunodebind=False,
+        )
+        if parallel_config.numa_bind_cpus is not None
+        else _get_auto_cpu_binding(numa_nodes)
+    )
 
-    if cpu_binding is not None:
+    if binding.cpu_list is not None:
         logger.info(
             "Binding worker subprocess (local_rank=%s, gpu_index=%s) to CPUs %s and NUMA node %s",  # noqa: E501
             local_rank,
             gpu_index,
-            cpu_binding,
+            binding.cpu_list,
             numa_node,
         )
-        return f"--physcpubind={cpu_binding} --membind={numa_node}"
+        return f"--physcpubind={binding.cpu_list} --membind={numa_node}"
+
+    if not binding.use_cpunodebind:
+        logger.info(
+            "Binding worker subprocess (local_rank=%s, gpu_index=%s) to "
+            "NUMA node %s memory without CPU binding",
+            local_rank,
+            gpu_index,
+            numa_node,
+        )
+        return f"--membind={numa_node}"
 
     logger.info(
         "Binding worker subprocess (local_rank=%s, gpu_index=%s) to NUMA node %s",
@@ -415,28 +485,36 @@ def _get_numactl_enginecore_args(
     workers' ``--physcpubind`` spawns require. We fall back to
     ``--cpunodebind=<shard nodes>`` instead, which is always a safe
     superset. PCT auto-detection still applies when the user did not pass
-    ``--numa-bind-cpus`` (its priority-core union across the shard nodes
-    is also a safe superset by construction).
+    ``--numa-bind-cpus``; both EngineCore and workers intersect the selected
+    priority-core union with their respective current CPU set before binding.
     """
     shard_nodes = _get_enginecore_numa_nodes(parallel_config, dp_local_rank)
     membind_arg = ",".join(str(n) for n in shard_nodes)
 
-    pct_cpus = (
-        None
+    binding = (
+        _CpuBinding(cpu_list=None, use_cpunodebind=True)
         if parallel_config.numa_bind_cpus is not None
-        else _maybe_get_pct_cpu_binding(shard_nodes)
+        else _get_auto_cpu_binding(shard_nodes)
     )
 
-    if pct_cpus is not None:
-        cpu_binding = ",".join(str(c) for c in pct_cpus)
+    if binding.cpu_list is not None:
         logger.info(
             "Binding EngineCore subprocess (local_rank=%s) to CPUs %s "
             "and NUMA nodes %s",
             local_rank,
-            cpu_binding,
+            binding.cpu_list,
             membind_arg,
         )
-        return f"--physcpubind={cpu_binding} --membind={membind_arg}"
+        return f"--physcpubind={binding.cpu_list} --membind={membind_arg}"
+
+    if not binding.use_cpunodebind:
+        logger.info(
+            "Binding EngineCore subprocess (local_rank=%s) to NUMA nodes %s "
+            "memory without CPU binding",
+            local_rank,
+            membind_arg,
+        )
+        return f"--membind={membind_arg}"
 
     logger.info(
         "Binding EngineCore subprocess (local_rank=%s) to NUMA nodes %s",
@@ -487,7 +565,7 @@ def _probe_numactl_args(numactl_args: str) -> bool:
 
 
 def _resolve_numactl_args(numactl_args: str) -> str:
-    """Drop ``--membind`` if the container rejects it, keeping CPU binding."""
+    """Drop ``--membind`` if the runtime rejects it, keeping CPU binding."""
     cpu_only = " ".join(
         t for t in numactl_args.split() if not t.startswith("--membind=")
     )

@@ -19,6 +19,8 @@ def _disable_pct_by_default(monkeypatch):
     live filesystem and silently re-route "baseline" tests through the PCT
     path. Stub ``/proc/cpuinfo`` and ``acpi_cppc/highest_perf`` to a state
     that fails the gate; ``_patch_pct_gates`` re-stubs on top when needed.
+    Stub ``_node_cpus`` to keep baseline tests off the CPU set intersection
+    path unless they opt in explicitly.
     """
     from io import StringIO
 
@@ -32,6 +34,7 @@ def _disable_pct_by_default(monkeypatch):
         return real_open(path, *args, **kwargs)
 
     monkeypatch.setattr("builtins.open", _no_pct_open)
+    monkeypatch.setattr(numa_utils, "_node_cpus", lambda node: set())
     numa_utils._pct_sku_config.cache_clear()
     yield
     numa_utils._pct_sku_config.cache_clear()
@@ -92,10 +95,9 @@ def _patch_pct_gates(
     the test pick which Granite Rapids SKU appears in the fake
     ``/proc/cpuinfo`` ``model name`` (only used when ``model_match=True``).
     """
-    import pathlib
     from io import StringIO
 
-    import regex as re
+    from vllm.utils.cpu_resource_utils import parse_id_list
 
     cpuinfo = (
         f"processor\t: 0\nmodel name\t: Intel(R) Xeon(R) Platinum {sku} CPU @ 2.40GHz\n"
@@ -114,27 +116,21 @@ def _patch_pct_gates(
             return StringIO(f"{highest_perf}\n")
         return real_open(path, *args, **kwargs)
 
-    real_read_text = pathlib.Path.read_text
     cpulist_by_node = cpulist_by_node or {}
 
-    def fake_read_text(self, *args, **kwargs):
-        path_str = str(self)
-        if path_str.endswith("/cpulist") and "/sys/devices/system/node" in path_str:
-            match = re.search(r"/node(\d+)/cpulist$", path_str)
-            if match:
-                node_id = int(match.group(1))
-                if node_id in cpulist_by_node:
-                    val = cpulist_by_node[node_id]
-                    if val is None:
-                        raise OSError(f"missing cpulist for node{node_id}")
-                    return val
-            if cpulist is None:
-                raise OSError("missing cpulist")
-            return cpulist
-        return real_read_text(self, *args, **kwargs)
-
     monkeypatch.setattr("builtins.open", fake_open)
-    monkeypatch.setattr("pathlib.Path.read_text", fake_read_text)
+
+    def fake_node_cpus(node):
+        if node in cpulist_by_node:
+            val = cpulist_by_node[node]
+            if val is None:
+                return set()
+            return set(parse_id_list(val))
+        if cpulist is None:
+            return set()
+        return set(parse_id_list(cpulist))
+
+    monkeypatch.setattr(numa_utils, "_node_cpus", fake_node_cpus)
     numa_utils._pct_sku_config.cache_clear()
 
 
@@ -206,11 +202,69 @@ def test_pct_binding_returns_none_when_node_cpulist_missing(monkeypatch):
 
 def test_get_numactl_args_uses_pct_when_user_did_not_specify_cpus(monkeypatch):
     _patch_pct_gates(monkeypatch, model_match=True, highest_perf=46)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(128)))
     vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[0, 1])
     assert (
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
         == "--physcpubind=0,1,16,17,64,65,80,81 --membind=1"
     )
+
+
+def test_get_numactl_args_pct_intersects_allowed_cpus(monkeypatch):
+    _patch_pct_gates(monkeypatch, model_match=True, highest_perf=46)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {1, 65, 200})
+    vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[0, 1])
+    assert (
+        numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
+        == "--physcpubind=1,65 --membind=1"
+    )
+
+
+def test_get_numactl_args_node_binding_intersects_allowed_cpus(monkeypatch):
+    monkeypatch.setattr(numa_utils, "_node_cpus", lambda node: set(range(64, 128)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {65, 66, 200})
+    vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[1])
+    assert (
+        numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=0)
+        == "--physcpubind=65,66 --membind=1"
+    )
+
+
+def test_get_numactl_args_node_binding_uses_cpunodebind_when_unconstrained(
+    monkeypatch,
+):
+    monkeypatch.setattr(numa_utils, "_node_cpus", lambda node: set(range(64, 128)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(64, 128)))
+    vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[1])
+    assert (
+        numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=0)
+        == "--cpunodebind=1 --membind=1"
+    )
+
+
+def test_get_numactl_args_node_binding_skips_disjoint_cpus(monkeypatch, caplog):
+    monkeypatch.setattr(numa_utils, "_node_cpus", lambda node: set(range(64, 128)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {1, 2, 200})
+    vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[1])
+
+    assert (
+        numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=0)
+        == "--membind=1"
+    )
+    assert "NUMA node CPUs for NUMA nodes [1] have no CPUs allowed" in caplog.text
+
+
+def test_get_numactl_args_pct_empty_intersection_falls_back_to_node_cpus(
+    monkeypatch, caplog
+):
+    _patch_pct_gates(monkeypatch, model_match=True, highest_perf=46)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {66, 67, 200})
+    vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[0])
+    assert (
+        numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=0)
+        == "--physcpubind=66,67 --membind=0"
+    )
+    assert "PCT priority CPUs for NUMA nodes [0] have no CPUs allowed" in caplog.text
 
 
 def test_get_numactl_args_engine_core_baseline_single_node_shard():
@@ -239,6 +293,35 @@ def test_get_numactl_args_engine_core_baseline_spans_shard_numa_nodes():
     )
 
 
+def test_get_numactl_args_engine_core_node_binding_intersects_allowed_cpus(
+    monkeypatch,
+):
+    monkeypatch.setattr(numa_utils, "_node_cpus", lambda node: set(range(64, 128)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {65, 66, 200})
+    vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[1])
+    assert (
+        numa_utils._get_numactl_enginecore_args(
+            vllm_config.parallel_config, local_rank=0
+        )
+        == "--physcpubind=65,66 --membind=1"
+    )
+
+
+def test_get_numactl_args_engine_core_node_binding_skips_disjoint_cpus(
+    monkeypatch, caplog
+):
+    monkeypatch.setattr(numa_utils, "_node_cpus", lambda node: set(range(64, 128)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {1, 2, 200})
+    vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[1])
+    assert (
+        numa_utils._get_numactl_enginecore_args(
+            vllm_config.parallel_config, local_rank=0
+        )
+        == "--membind=1"
+    )
+    assert "NUMA node CPUs for NUMA nodes [1] have no CPUs allowed" in caplog.text
+
+
 def test_get_numactl_args_engine_core_pct_spans_shard_numa_nodes(monkeypatch):
     """PCT: EngineCore for a multi-NUMA shard binds to the union of priority
     cores across all shard nodes, so worker `--physcpubind` is always a
@@ -249,6 +332,7 @@ def test_get_numactl_args_engine_core_pct_spans_shard_numa_nodes(monkeypatch):
         highest_perf=46,
         cpulist_by_node={0: "0-31,128-159", 1: "64-95,192-223"},
     )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(256)))
     vllm_config = _make_config(
         numa_bind=True,
         numa_bind_nodes=[0, 0, 1, 1],
@@ -271,6 +355,7 @@ def test_get_numactl_args_engine_core_pct_dp_shard_picks_local_nodes(monkeypatch
         highest_perf=46,
         cpulist_by_node={0: "0-31,128-159", 1: "64-95,192-223"},
     )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(256)))
     vllm_config = _make_config(
         numa_bind=True,
         numa_bind_nodes=[0, 0, 1, 1],
@@ -299,6 +384,7 @@ def test_get_numactl_args_engine_core_pct_external_launcher_spans_local_nodes(
         highest_perf=46,
         cpulist_by_node={0: "0-31,128-159", 1: "64-95,192-223"},
     )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(256)))
     vllm_config = _make_config(
         numa_bind=True,
         numa_bind_nodes=[0, 0, 0, 0, 1, 1, 1, 1],
@@ -387,6 +473,30 @@ def test_get_numactl_args_requires_detectable_nodes(monkeypatch):
     monkeypatch.setattr(numa_utils, "get_auto_numa_nodes", lambda: None)
     with pytest.raises(RuntimeError):
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=0)
+
+
+def test_auto_numa_detection_does_not_consult_cpu_affinity(monkeypatch):
+    """Auto-detect GPU topology even if CPU-affinity helpers are unavailable."""
+
+    class FakePlatform:
+        @staticmethod
+        def is_cuda_alike():
+            return True
+
+        @staticmethod
+        def get_all_device_numa_nodes():
+            return [2, 2]
+
+    import vllm.platforms
+
+    numa_utils.get_auto_numa_nodes.cache_clear()
+    monkeypatch.setattr(vllm.platforms, "current_platform", FakePlatform())
+    monkeypatch.setattr(os.path, "isdir", lambda path: path.endswith("node1"))
+    monkeypatch.setattr(numa_utils, "_can_set_mempolicy", lambda: True)
+    monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+
+    assert numa_utils.get_auto_numa_nodes() == [2, 2]
+    numa_utils.get_auto_numa_nodes.cache_clear()
 
 
 def test_configure_subprocess_rejects_unknown_process_kind():

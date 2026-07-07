@@ -150,8 +150,13 @@ desired NUMA policy from the beginning.
 
 Use `--numa-bind` to enable the feature. By default, vLLM auto-detects the
 GPU-to-NUMA mapping and uses `--cpunodebind=<node> --membind=<node>` for each
-worker. When you need a custom CPU policy, add `--numa-bind-cpus` and vLLM will
-switch to `--physcpubind=<cpu-list> --membind=<node>`.
+worker. If the process already has a constrained CPU set, or if vLLM
+auto-detects priority CPU cores, vLLM intersects the auto-selected CPUs with the
+process CPU set and may use `--physcpubind=<cpu-list> --membind=<node>` instead.
+When you need a custom CPU policy, add `--numa-bind-cpus` and vLLM will switch
+to `--physcpubind=<cpu-list> --membind=<node>`.
+If no CPUs from the target NUMA node are allowed by the current CPU set, vLLM
+keeps the memory policy and skips CPU binding for that process.
 
 These `--numa-bind*` options only apply to GPU execution processes. They do not
 configure the CPU backend's separate thread-affinity controls. Automatic
@@ -191,7 +196,7 @@ Notes:
 - Automatic detection relies on NVML and NUMA support from the host. If it cannot determine the mapping reliably, pass `--numa-bind-nodes` explicitly.
 - Explicit `--numa-bind-nodes` and `--numa-bind-cpus` values must be valid `numactl` inputs. vLLM does a small amount of validation, but the effective binding semantics are still determined by `numactl`.
 - The current implementation binds GPU execution processes such as `EngineCore` and multiprocessing workers. It does not apply NUMA binding to frontend API server processes or the DP coordinator.
-- In containerized environments, NUMA policy syscalls may require extra permissions, such as `--cap-add SYS_NICE` when running via `docker run`.
+- In restricted runtimes, NUMA policy syscalls may require extra permissions, such as `CAP_SYS_NICE`.
 
 ### CPU Backend Thread Affinity
 
