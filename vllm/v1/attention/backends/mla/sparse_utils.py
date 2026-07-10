@@ -128,6 +128,8 @@ def triton_convert_req_index_to_global_index(
     prefill_workspace_request_ids: torch.Tensor | None = None,
     prefill_workspace_starts: torch.Tensor | None = None,
     return_valid_counts: bool = False,
+    out: torch.Tensor | None = None,
+    valid_counts_out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     out[token_id, indice_id] =
@@ -150,6 +152,9 @@ def triton_convert_req_index_to_global_index(
 
     When return_valid_counts is True, also returns the count of valid (non -1)
     indices per row, computed during the same kernel pass (no extra overhead).
+
+    ``out`` and ``valid_counts_out`` let hot-path callers reuse CUDA-graph-stable
+    buffers instead of allocating temporary tensors on every invocation.
     """
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
@@ -169,17 +174,38 @@ def triton_convert_req_index_to_global_index(
     max_num_blocks_per_req = block_table.shape[1]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
-    # Ensure contiguous tensors on the same device
+    # req_id is indexed directly; the other inputs use their runtime strides.
     req_id_c = req_id.contiguous()
-    block_table_c = block_table.contiguous()
-    token_indices_c = token_indices.contiguous()
-    out = torch.empty_like(token_indices_c)
+    block_table_c = block_table
+    token_indices_c = token_indices
+    if out is None:
+        out = torch.empty_like(token_indices_c)
+    else:
+        assert out.device == token_indices.device
+        assert out.dtype == torch.int32
+        assert out.dim() == 2
+        assert out.shape[0] >= num_tokens
+        assert out.shape[1] >= NUM_TOPK_TOKENS
+        out = out[:num_tokens, :NUM_TOPK_TOKENS]
 
     # Allocate valid count buffer if needed (must be zero-initialized for atomics)
     valid_counts: torch.Tensor | None = None
     if return_valid_counts:
-        valid_counts = torch.zeros(
-            num_tokens, dtype=torch.int32, device=token_indices.device
+        if valid_counts_out is None:
+            valid_counts = torch.zeros(
+                num_tokens, dtype=torch.int32, device=token_indices.device
+            )
+        else:
+            assert valid_counts_out.device == token_indices.device
+            assert valid_counts_out.dtype == torch.int32
+            assert valid_counts_out.dim() == 1
+            assert valid_counts_out.is_contiguous()
+            assert valid_counts_out.numel() >= num_tokens
+            valid_counts = valid_counts_out[:num_tokens]
+            valid_counts.zero_()
+    else:
+        assert valid_counts_out is None, (
+            "valid_counts_out requires return_valid_counts=True"
         )
 
     # Strides in elements

@@ -926,8 +926,9 @@ def _run_mla_benchmark_batched(
     """
     Unified batched MLA benchmark runner for all backends.
 
-    Works for: flashattn_mla, flashmla, flashinfer_mla, cutlass_mla,
-               flashinfer_mla_sparse, flashmla_sparse
+    Works for: FLASH_ATTN_MLA, FLASH_ATTN_MLA_SPARSE, FLASHMLA,
+               FLASHINFER_MLA, CUTLASS_MLA, FLASHINFER_MLA_SPARSE,
+               FLASHMLA_SPARSE
 
     This function reuses backend initialization across multiple benchmarks
     to avoid setup/teardown overhead.
@@ -1096,14 +1097,16 @@ def run_mla_benchmark(
     """
     Unified MLA benchmark runner for all backends.
 
-    Works for: flashattn_mla, flashmla, flashinfer_mla, cutlass_mla,
-               flashinfer_mla_sparse, flashmla_sparse
+    Works for: FLASH_ATTN_MLA, FLASH_ATTN_MLA_SPARSE, FLASHMLA,
+               FLASHINFER_MLA, CUTLASS_MLA, FLASHINFER_MLA_SPARSE,
+               FLASHMLA_SPARSE
 
     Always uses batched execution internally for optimal performance.
 
     Args:
-        backend: Backend name (flashattn_mla, flashmla, flashinfer_mla, cutlass_mla,
-                 flashinfer_mla_sparse, flashmla_sparse)
+        backend: Backend name (FLASH_ATTN_MLA, FLASH_ATTN_MLA_SPARSE, FLASHMLA,
+                 FLASHINFER_MLA, CUTLASS_MLA, FLASHINFER_MLA_SPARSE,
+                 FLASHMLA_SPARSE)
         config: BenchmarkConfig or list of (BenchmarkConfig, param) tuples
         reorder_batch_threshold: Threshold override for FlashAttn/FlashMLA
                                  (single config mode only)

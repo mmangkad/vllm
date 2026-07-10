@@ -482,8 +482,9 @@ def main():
         "--backends",
         "--decode-backends",
         nargs="+",
-        help="Decode backends to benchmark (flash, triton, flashinfer, cutlass_mla, "
-        "flashinfer_mla, flashattn_mla, flashmla)",
+        help="Decode backends to benchmark (FLASH_ATTN, TRITON_ATTN, FLASHINFER, "
+        "CUTLASS_MLA, FLASHINFER_MLA, FLASH_ATTN_MLA, "
+        "FLASH_ATTN_MLA_SPARSE, FLASHMLA, FLASHMLA_SPARSE)",
     )
     parser.add_argument(
         "--backend",
