@@ -484,6 +484,7 @@ class EngineArgs:
         "split_priority_single_thread",
         "full_node",
         "hybrid",
+        "local_memory",
     ] = ParallelConfig.numa_bind_enginecore_policy
     device_ids: list[int | str] | None = None
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size

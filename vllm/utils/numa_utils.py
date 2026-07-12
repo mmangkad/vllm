@@ -31,6 +31,7 @@ NumaPolicy = Literal[
     "split_priority_single_thread",
     "full_node",
     "hybrid",
+    "local_memory",
 ]
 NUMA_POLICIES = frozenset(
     {
@@ -40,6 +41,7 @@ NUMA_POLICIES = frozenset(
         "split_priority_single_thread",
         "full_node",
         "hybrid",
+        "local_memory",
     }
 )
 _HYBRID_ORDINARY_CPUS = 4
@@ -458,10 +460,19 @@ def _log_numa_policy_fallback(
 
 def _numa_policy(parallel_config, process_kind: str) -> NumaPolicy:
     value = (
-        getattr(parallel_config, "numa_bind_worker_policy", "shared_priority")
+        getattr(
+            parallel_config,
+            "numa_bind_worker_policy",
+            "split_priority_single_thread",
+        )
         if process_kind == "worker"
-        else getattr(parallel_config, "numa_bind_enginecore_policy", "shared_priority")
+        else getattr(parallel_config, "numa_bind_enginecore_policy", "local_memory")
     )
+    if process_kind == "worker" and value == "local_memory":
+        raise ValueError(
+            "NUMA policy 'local_memory' is EngineCore-only; choose a worker CPU "
+            "binding policy instead"
+        )
     return cast(NumaPolicy, value)
 
 
@@ -604,20 +615,25 @@ def _get_numactl_enginecore_args(
 ) -> str:
     """Compute the numactl args for an EngineCore subprocess.
 
-    ``--numa-bind-cpus`` is deliberately ignored here: the user provides a
-    per-worker CPU list, and binding EngineCore to any of those entries
-    would shrink its ``cpus_allowed`` below the strict-superset that the
-    workers' ``--physcpubind`` spawns require. We fall back to
-    ``--cpunodebind=<shard nodes>`` instead, which is always a safe
-    superset. PCT auto-detection still applies when the user did not pass
-    ``--numa-bind-cpus`` (its priority-core union across the shard nodes
-    is also a safe superset by construction).
+    ``--numa-bind-cpus`` is deliberately ignored here because it contains
+    per-worker CPU lists. The default ``local_memory`` policy preserves the
+    EngineCore's inherited CPU affinity while binding memory allocations to
+    its DP shard's GPU-local NUMA nodes. Other policies may explicitly bind
+    EngineCore CPUs when requested.
     """
     shard_nodes = _get_enginecore_numa_nodes(parallel_config, dp_local_rank)
     membind_arg = ",".join(str(n) for n in shard_nodes)
     policy = _numa_policy(parallel_config, "EngineCore")
     if policy == "off":
         return ""
+    if policy == "local_memory":
+        logger.info(
+            "Binding EngineCore subprocess (local_rank=%s) to NUMA nodes %s "
+            "memory while preserving inherited CPU affinity",
+            local_rank,
+            membind_arg,
+        )
+        return f"--membind={membind_arg}"
 
     pct_cpus = None
     if parallel_config.numa_bind_cpus is None:
@@ -796,6 +812,11 @@ def configure_subprocess(
         yield
         return
 
+    if process_kind not in {"worker", "EngineCore"}:
+        raise ValueError(
+            f"Unknown process_kind {process_kind!r}; expected 'worker' or 'EngineCore'."
+        )
+
     policy = _numa_policy(parallel_config, process_kind)
     if process_kind == "EngineCore":
         numactl_args = _get_numactl_enginecore_args(
@@ -805,11 +826,6 @@ def configure_subprocess(
         numactl_args = _get_numactl_worker_args(
             parallel_config, local_rank, dp_local_rank
         )
-    else:
-        raise ValueError(
-            f"Unknown process_kind {process_kind!r}; expected 'worker' or 'EngineCore'."
-        )
-
     if not numactl_args:
         yield
         return

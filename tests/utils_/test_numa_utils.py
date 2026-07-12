@@ -279,6 +279,31 @@ def test_get_numactl_args_engine_core_baseline_single_node_shard():
     )
 
 
+def test_enginecore_local_memory_preserves_cpu_affinity():
+    config = _make_config(
+        numa_bind=True,
+        numa_bind_nodes=[2, 3],
+        tensor_parallel_size=2,
+        numa_bind_enginecore_policy="local_memory",
+    )
+    assert (
+        numa_utils._get_numactl_enginecore_args(config.parallel_config, local_rank=0)
+        == "--membind=2,3"
+    )
+
+
+def test_measured_numa_policies_are_defaults():
+    config = ParallelConfig()
+    assert config.numa_bind_worker_policy == "split_priority_single_thread"
+    assert config.numa_bind_enginecore_policy == "local_memory"
+
+
+def test_local_memory_policy_is_enginecore_only():
+    config = _make_config(numa_bind_worker_policy="local_memory")
+    with pytest.raises(ValueError, match="EngineCore-only"):
+        numa_utils._numa_policy(config.parallel_config, "worker")
+
+
 def test_get_numactl_args_engine_core_baseline_spans_shard_numa_nodes():
     """Baseline (no PCT): a TP=4 shard spanning both NUMA nodes -> bind to both."""
     vllm_config = _make_config(

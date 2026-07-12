@@ -196,12 +196,11 @@ class CoreEngineProcManager:
 
                 with numa_utils.configure_subprocess(
                     # EngineCore itself does not have a TP/PP-local rank.
-                    # When DP is enabled, set_assigned_physical_gpu_ids_for_dp_rank()
-                    # populates the logical-to-physical mapping for this DP
-                    # shard, so local_rank=0 means "the first local GPU in
-                    # this shard". The actual TP/PP worker processes spawned
-                    # by the executor are bound separately with their own
-                    # local_rank values.
+                    # In DP, set_assigned_physical_gpu_ids_for_dp_rank() populates
+                    # the logical-to-physical mapping for this DP shard. In all
+                    # modes, local_rank=0 means "the first local GPU in this
+                    # shard". The actual TP/PP worker processes are bound
+                    # separately with their own local_rank values.
                     vllm_config,
                     local_rank=0,
                     dp_local_rank=local_dp_rank,

@@ -309,7 +309,7 @@ class ParallelConfig:
         "split_priority_single_thread",
         "full_node",
         "hybrid",
-    ] = "shared_priority"
+    ] = "split_priority_single_thread"
     """Automatic CPU-selection policy for GPU worker processes."""
     numa_bind_enginecore_policy: Literal[
         "off",
@@ -318,7 +318,8 @@ class ParallelConfig:
         "split_priority_single_thread",
         "full_node",
         "hybrid",
-    ] = "shared_priority"
+        "local_memory",
+    ] = "local_memory"
     """Automatic CPU-selection policy for EngineCore processes."""
     assigned_physical_gpu_ids: list[int] | None = None
     """Mapping from vLLM-local logical GPU IDs to physical GPU IDs.

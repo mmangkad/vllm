@@ -157,17 +157,20 @@ so the interpreter, imports, and early allocator state are created with the
 desired NUMA policy from the beginning.
 
 Use `--numa-bind` to enable the feature. By default, vLLM auto-detects the
-GPU-to-NUMA mapping and uses `--cpunodebind=<node> --membind=<node>` for each
-worker. When you need a custom CPU policy, add `--numa-bind-cpus` and vLLM will
-switch to `--physcpubind=<cpu-list> --membind=<node>`.
+GPU-to-NUMA mapping and assigns each worker one PCT priority CPU. On hosts where
+PCT priority CPUs cannot be detected, it falls back to binding the worker to its
+GPU-local NUMA node. When you need a custom CPU policy, add `--numa-bind-cpus`
+and vLLM will use `--physcpubind=<cpu-list> --membind=<node>`.
 
 Automatic CPU selection can be tuned independently with
 `--numa-bind-worker-policy` and `--numa-bind-enginecore-policy`. The supported
-policies are `shared_priority` (the default), `split_priority_smt`,
-`split_priority_single_thread`, `hybrid`, `full_node`, and `off`. Split policies
-assign PCT sibling groups deterministically among workers on a NUMA node;
-`hybrid` also assigns up to four ordinary CPUs. If PCT priority cores cannot be
-detected, the priority policies fall back to full-node binding.
+worker policies are `split_priority_single_thread` (the default),
+`split_priority_smt`, `shared_priority`, `hybrid`, `full_node`, and `off`. Split
+policies assign PCT sibling groups deterministically among workers on a NUMA
+node; `hybrid` also assigns up to four ordinary CPUs. If PCT priority cores
+cannot be detected, the priority policies fall back to full-node binding. The
+EngineCore default is `local_memory`, which preserves inherited CPU affinity
+while keeping allocations on the NUMA nodes local to its DP shard.
 
 These `--numa-bind*` options only apply to GPU execution processes. They do not
 configure the CPU backend's separate thread-affinity controls. Automatic
@@ -206,7 +209,7 @@ Notes:
 - CLI usage forces multiprocessing to use the `spawn` method automatically. If you enable NUMA binding through the Python API, also set `VLLM_WORKER_MULTIPROC_METHOD=spawn`.
 - Automatic detection relies on NVML and NUMA support from the host. If it cannot determine the mapping reliably, pass `--numa-bind-nodes` explicitly.
 - Explicit `--numa-bind-nodes` and `--numa-bind-cpus` values must be valid `numactl` inputs. vLLM does a small amount of validation, but the effective binding semantics are still determined by `numactl`.
-- The current implementation binds GPU execution processes such as `EngineCore` and multiprocessing workers. It does not apply NUMA binding to frontend API server processes or the DP coordinator.
+- The current implementation binds multiprocessing GPU workers and `EngineCore` processes. EngineCore defaults to memory-only NUMA placement in both pure-TP and DP configurations, preserving its inherited CPU affinity. It does not apply NUMA binding to frontend API server processes.
 - In containerized environments, NUMA policy syscalls may require extra permissions, such as `--cap-add SYS_NICE` when running via `docker run`.
 
 ### CPU Backend Thread Affinity

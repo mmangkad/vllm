@@ -620,6 +620,8 @@ def test_numa_bind_args():
     assert engine_args.numa_bind is True
     assert engine_args.numa_bind_nodes == [0, 0, 1, 1]
     assert engine_args.numa_bind_cpus == ["0-3", "4-7", "8-11", "12-15"]
+    assert engine_args.numa_bind_worker_policy == "split_priority_single_thread"
+    assert engine_args.numa_bind_enginecore_policy == "local_memory"
 
 
 def test_ir_op_priority():
