@@ -253,6 +253,21 @@ def test_off_policy_skips_numactl(monkeypatch):
         pass
 
 
+def test_full_node_policy_does_not_reuse_pct_binding(monkeypatch):
+    monkeypatch.setattr(numa_utils, "_maybe_get_pct_cpu_binding", lambda nodes: [0, 1])
+    monkeypatch.setattr(numa_utils, "_node_cpus", lambda node: {0, 1, 2, 3})
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2, 3})
+    config = _make_config(
+        numa_bind=True,
+        numa_bind_nodes=[0],
+        numa_bind_worker_policy="full_node",
+    )
+    assert (
+        numa_utils._get_numactl_worker_args(config.parallel_config, 0)
+        == "--cpunodebind=0 --membind=0"
+    )
+
+
 def test_get_numactl_args_engine_core_baseline_single_node_shard():
     """Baseline (no PCT): single-NUMA shard -> single-node bind."""
     vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[0, 1])
@@ -535,7 +550,9 @@ def test_configure_subprocess_numa_fallback(monkeypatch):
     membind_fails = _fake_numactl_run(["--membind="])
     monkeypatch.setattr(numa_utils.subprocess, "run", membind_fails)
     with numa_utils.configure_subprocess(node_config, local_rank=0):
-        assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--cpunodebind=0"
+        assert (
+            os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--cpunodebind=0 --preferred=0"
+        )
 
     cpu_config = _make_config(
         numa_bind=True,
@@ -543,7 +560,10 @@ def test_configure_subprocess_numa_fallback(monkeypatch):
         numa_bind_cpus=["0-3"],
     )
     with numa_utils.configure_subprocess(cpu_config, local_rank=0):
-        assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--physcpubind=0-3"
+        assert (
+            os.environ[numa_utils._NUMACTL_ARGS_ENV]
+            == "--physcpubind=0-3 --preferred=0"
+        )
 
     before = multiprocessing.spawn.get_executable()
     monkeypatch.setattr(
@@ -554,3 +574,31 @@ def test_configure_subprocess_numa_fallback(monkeypatch):
     with numa_utils.configure_subprocess(node_config, local_rank=0):
         assert multiprocessing.spawn.get_executable() == before
         assert numa_utils._NUMACTL_ARGS_ENV not in os.environ
+
+
+def test_multi_node_membind_skips_preferred_fallback(monkeypatch):
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0 if len(calls) == 2 else 1, stderr=b"")
+
+    monkeypatch.setattr(numa_utils.subprocess, "run", run)
+    assert (
+        numa_utils._resolve_numactl_args("--physcpubind=0,1,64,65 --membind=0,1")
+        == "--physcpubind=0,1,64,65"
+    )
+    assert len(calls) == 2
+    assert not any("--preferred=0,1" in call for call in calls)
+
+
+def test_final_binding_log_describes_relaxed_memory_policy(caplog):
+    caplog.set_level("INFO", logger="vllm.utils.numa_utils")
+    numa_utils._log_final_numa_binding_decision(
+        "EngineCore",
+        "shared_priority",
+        0,
+        "--physcpubind=16,17 --preferred=0",
+    )
+    assert "exact CPU(s) [16,17]" in caplog.text
+    assert "preferred memory node [0]" in caplog.text

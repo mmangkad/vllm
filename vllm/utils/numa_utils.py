@@ -437,6 +437,25 @@ def _numa_fallback_cpu_binding(
     return None
 
 
+def _log_numa_policy_fallback(
+    requested_node: int,
+    fallback_node: int,
+    policy: NumaPolicy,
+    target_cpus: set[int],
+    gpu_index: int,
+) -> None:
+    logger.warning(
+        "NUMA policy %r has no eligible priority CPU for GPU %d on node %d; "
+        "falling back to allowed CPUs %s on %s node %d.",
+        policy,
+        gpu_index,
+        requested_node,
+        sorted(target_cpus),
+        "local" if fallback_node == requested_node else "nearest available",
+        fallback_node,
+    )
+
+
 def _numa_policy(parallel_config, process_kind: str) -> NumaPolicy:
     value = (
         getattr(parallel_config, "numa_bind_worker_policy", "shared_priority")
@@ -453,16 +472,11 @@ def _worker_index_on_numa_node(parallel_config, gpu_index: int, node: int) -> in
     return sum(1 for index in range(gpu_index) if numa_nodes[index] == node)
 
 
-def _get_cpu_binding(
-    parallel_config, gpu_index: int, numa_nodes: list[int]
-) -> str | None:
-    """Return the CPU list a process should be pinned to (or None)."""
+def _get_cpu_binding(parallel_config, gpu_index: int) -> str | None:
+    """Return the explicit per-GPU CPU list, if configured."""
     cpu_bindings = parallel_config.numa_bind_cpus
     if cpu_bindings is None:
-        pct_cpus = _maybe_get_pct_cpu_binding(numa_nodes)
-        if pct_cpus is None:
-            return None
-        return ",".join(str(c) for c in pct_cpus)
+        return None
 
     if gpu_index >= len(cpu_bindings):
         raise ValueError(
@@ -481,7 +495,7 @@ def _get_numactl_worker_args(
     policy = _numa_policy(parallel_config, "worker")
     if policy == "off":
         return ""
-    cpu_binding = _get_cpu_binding(parallel_config, gpu_index, [numa_node])
+    cpu_binding = _get_cpu_binding(parallel_config, gpu_index)
     if parallel_config.numa_bind_cpus is None:
         allowed = os.sched_getaffinity(0)
         policy_cpus = _policy_cpu_binding(
@@ -497,7 +511,11 @@ def _get_numactl_worker_args(
                     "No allowed CPU is available for NUMA node %d", numa_node
                 )
                 return ""
-            numa_node, target = fallback
+            fallback_node, target = fallback
+            _log_numa_policy_fallback(
+                numa_node, fallback_node, policy, target, gpu_index
+            )
+            numa_node = fallback_node
             cpu_binding = ",".join(str(cpu) for cpu in sorted(target))
         elif policy_cpus is not None:
             target = set(policy_cpus) & allowed
@@ -505,7 +523,11 @@ def _get_numactl_worker_args(
                 fallback = _numa_fallback_cpu_binding(numa_node, allowed)
                 if fallback is None:
                     return ""
-                numa_node, target = fallback
+                fallback_node, target = fallback
+                _log_numa_policy_fallback(
+                    numa_node, fallback_node, policy, target, gpu_index
+                )
+                numa_node = fallback_node
             cpu_binding = ",".join(str(cpu) for cpu in sorted(target))
         else:
             node_cpus = _node_cpus(numa_node)
@@ -515,7 +537,11 @@ def _get_numactl_worker_args(
                     fallback = _numa_fallback_cpu_binding(numa_node, allowed)
                     if fallback is None:
                         return ""
-                    numa_node, target = fallback
+                    fallback_node, target = fallback
+                    _log_numa_policy_fallback(
+                        numa_node, fallback_node, policy, target, gpu_index
+                    )
+                    numa_node = fallback_node
                 if target != node_cpus:
                     cpu_binding = ",".join(str(cpu) for cpu in sorted(target))
 
@@ -657,35 +683,104 @@ def log_current_affinity_state(label: str) -> None:
     _log_numactl_show(label)
 
 
-def _probe_numactl_args(numactl_args: str) -> bool:
-    """Whether ``numactl <args> true`` succeeds in this (parent) environment."""
+def _probe_numactl_args(numactl_args: str) -> tuple[bool, str]:
+    """Probe a NUMA policy, returning success and captured stderr."""
     try:
         result = subprocess.run(
             ["numactl", *numactl_args.split(), "true"],
             capture_output=True,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
+    stderr = getattr(result, "stderr", b"") or b""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    return result.returncode == 0, stderr.strip()
 
 
 def _resolve_numactl_args(numactl_args: str) -> str:
-    """Drop ``--membind`` if the container rejects it, keeping CPU binding."""
+    """Return the strongest NUMA policy accepted by the runtime."""
     cpu_only = " ".join(
         t for t in numactl_args.split() if not t.startswith("--membind=")
     )
-    for candidate in (numactl_args, cpu_only, ""):
-        if _probe_numactl_args(candidate):
+    candidates = [numactl_args]
+    membind = next(
+        (
+            token.removeprefix("--membind=")
+            for token in numactl_args.split()
+            if token.startswith("--membind=")
+        ),
+        None,
+    )
+    if membind is not None and "," not in membind:
+        candidates.append(numactl_args.replace("--membind=", "--preferred="))
+    if cpu_only and cpu_only != numactl_args:
+        candidates.append(cpu_only)
+
+    last_error = ""
+    for candidate in candidates:
+        succeeded, error = _probe_numactl_args(candidate)
+        if succeeded:
             if candidate != numactl_args:
                 logger.warning(
-                    "numactl args %r rejected; falling back to %r. Add "
-                    "--cap-add SYS_NICE for full NUMA binding.",
+                    "numactl rejected %r%s; falling back to %r.",
                     numactl_args,
-                    candidate or "no binding",
+                    f": {last_error}" if last_error else "",
+                    candidate,
                 )
             return candidate
+        last_error = error
+    logger.warning(
+        "numactl could not apply NUMA binding %r%s; launching without binding.",
+        numactl_args,
+        f": {last_error}" if last_error else "",
+    )
     return ""
+
+
+def _log_final_numa_binding_decision(
+    process_kind: str,
+    policy: NumaPolicy,
+    local_rank: int,
+    numactl_args: str,
+) -> None:
+    def value(prefix: str) -> str | None:
+        return next(
+            (
+                token.removeprefix(prefix)
+                for token in numactl_args.split()
+                if token.startswith(prefix)
+            ),
+            None,
+        )
+
+    physical_cpus = value("--physcpubind=")
+    cpu_nodes = value("--cpunodebind=")
+    cpu_binding = (
+        f"exact CPU(s) [{physical_cpus}]"
+        if physical_cpus is not None
+        else f"all allowed CPUs on NUMA node(s) [{cpu_nodes}]"
+        if cpu_nodes is not None
+        else "inherited CPU affinity"
+    )
+    memory_nodes = value("--membind=")
+    preferred_node = value("--preferred=")
+    memory_binding = (
+        f"strict memory node(s) [{memory_nodes}]"
+        if memory_nodes is not None
+        else f"preferred memory node [{preferred_node}]"
+        if preferred_node is not None
+        else "inherited memory policy"
+    )
+    logger.info(
+        "Final NUMA binding: %s local_rank=%d -> %s; %s; policy=%s",
+        process_kind,
+        local_rank,
+        cpu_binding,
+        memory_binding,
+        policy,
+    )
 
 
 @contextmanager
@@ -701,6 +796,7 @@ def configure_subprocess(
         yield
         return
 
+    policy = _numa_policy(parallel_config, process_kind)
     if process_kind == "EngineCore":
         numactl_args = _get_numactl_enginecore_args(
             parallel_config, local_rank, dp_local_rank
@@ -717,12 +813,22 @@ def configure_subprocess(
     if not numactl_args:
         yield
         return
+    logger.info(
+        "Preparing NUMA-bound subprocess: process_kind=%s parent_pid=%d "
+        "local_rank=%d policy=%s requested_numactl_args=%s",
+        process_kind,
+        os.getpid(),
+        local_rank,
+        policy,
+        numactl_args,
+    )
     executable, debug_str = _get_numactl_executable()
     numactl_args = _resolve_numactl_args(numactl_args)
     if not numactl_args:
         # No NUMA binding possible here; launch without the wrapper.
         yield
         return
+    _log_final_numa_binding_decision(process_kind, policy, local_rank, numactl_args)
     python_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     with (
         _set_numa_wrapper_env(numactl_args, python_executable),
