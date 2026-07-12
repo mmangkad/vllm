@@ -49,6 +49,8 @@ def _make_config(**parallel_kwargs):
         data_parallel_index=0,
         pipeline_parallel_size=1,
         tensor_parallel_size=1,
+        numa_bind_worker_policy="shared_priority",
+        numa_bind_enginecore_policy="shared_priority",
     )
     parallel_defaults.update(parallel_kwargs)
     parallel_config = SimpleNamespace(**parallel_defaults)
@@ -206,11 +208,49 @@ def test_pct_binding_returns_none_when_node_cpulist_missing(monkeypatch):
 
 def test_get_numactl_args_uses_pct_when_user_did_not_specify_cpus(monkeypatch):
     _patch_pct_gates(monkeypatch, model_match=True, highest_perf=46)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(256)))
     vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[0, 1])
     assert (
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
         == "--physcpubind=0,1,16,17,64,65,80,81 --membind=1"
     )
+
+
+def test_split_policy_assigns_sibling_groups_per_numa_worker(monkeypatch):
+    monkeypatch.setattr(
+        numa_utils, "_maybe_get_pct_cpu_binding", lambda nodes: [0, 64, 1, 65]
+    )
+    monkeypatch.setattr(
+        numa_utils, "_cpu_sibling_groups", lambda cpus: [[0, 64], [1, 65]]
+    )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(128)))
+    config = _make_config(
+        numa_bind=True,
+        numa_bind_nodes=[0, 0],
+        tensor_parallel_size=2,
+        numa_bind_worker_policy="split_priority_single_thread",
+    )
+    assert numa_utils._get_numactl_worker_args(config.parallel_config, 0).startswith(
+        "--physcpubind=0 "
+    )
+    assert numa_utils._get_numactl_worker_args(config.parallel_config, 1).startswith(
+        "--physcpubind=1 "
+    )
+
+
+def test_off_policy_skips_numactl(monkeypatch):
+    config = _make_config(
+        numa_bind=True,
+        numa_bind_nodes=[0],
+        numa_bind_worker_policy="off",
+    )
+    monkeypatch.setattr(
+        numa_utils,
+        "_get_numactl_executable",
+        lambda: pytest.fail("numactl wrapper must not be requested"),
+    )
+    with numa_utils.configure_subprocess(config, local_rank=0):
+        pass
 
 
 def test_get_numactl_args_engine_core_baseline_single_node_shard():
@@ -249,6 +289,7 @@ def test_get_numactl_args_engine_core_pct_spans_shard_numa_nodes(monkeypatch):
         highest_perf=46,
         cpulist_by_node={0: "0-31,128-159", 1: "64-95,192-223"},
     )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(256)))
     vllm_config = _make_config(
         numa_bind=True,
         numa_bind_nodes=[0, 0, 1, 1],
@@ -271,6 +312,7 @@ def test_get_numactl_args_engine_core_pct_dp_shard_picks_local_nodes(monkeypatch
         highest_perf=46,
         cpulist_by_node={0: "0-31,128-159", 1: "64-95,192-223"},
     )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(256)))
     vllm_config = _make_config(
         numa_bind=True,
         numa_bind_nodes=[0, 0, 1, 1],
@@ -299,6 +341,7 @@ def test_get_numactl_args_engine_core_pct_external_launcher_spans_local_nodes(
         highest_perf=46,
         cpulist_by_node={0: "0-31,128-159", 1: "64-95,192-223"},
     )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(256)))
     vllm_config = _make_config(
         numa_bind=True,
         numa_bind_nodes=[0, 0, 0, 0, 1, 1, 1, 1],
@@ -341,6 +384,7 @@ def test_get_numactl_args_engine_core_skips_user_cpu_list(monkeypatch):
     the user is explicit (its priority-core union may not be a superset
     of the user's per-worker cores)."""
     _patch_pct_gates(monkeypatch, model_match=True, highest_perf=46)
+    monkeypatch.setattr(numa_utils, "_node_cpus", lambda node: set())
     vllm_config = _make_config(
         numa_bind=True,
         numa_bind_nodes=[0, 0, 1, 1],

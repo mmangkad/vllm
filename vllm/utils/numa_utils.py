@@ -11,12 +11,10 @@ import logging
 import multiprocessing
 import os
 import subprocess
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
-
-import psutil
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
 from vllm import envs
 
@@ -26,6 +24,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _NUMACTL_ARGS_ENV = "_VLLM_INTERNAL_NUMACTL_ARGS"
 _NUMACTL_PYTHON_EXECUTABLE_ENV = "_VLLM_INTERNAL_NUMACTL_PYTHON_EXECUTABLE"
+NumaPolicy = Literal[
+    "off",
+    "shared_priority",
+    "split_priority_smt",
+    "split_priority_single_thread",
+    "full_node",
+    "hybrid",
+]
+NUMA_POLICIES = frozenset(
+    {
+        "off",
+        "shared_priority",
+        "split_priority_smt",
+        "split_priority_single_thread",
+        "full_node",
+        "hybrid",
+    }
+)
+_HYBRID_ORDINARY_CPUS = 4
 
 
 @cache
@@ -65,20 +82,6 @@ def _is_auto_numa_available() -> bool:
 
     if not os.path.isdir("/sys/devices/system/node/node1"):
         return False
-
-    try:
-        process = psutil.Process(os.getpid())
-        cpu_affinity = process.cpu_affinity()
-        cpu_count = psutil.cpu_count()
-        if cpu_count is not None and cpu_affinity != list(range(cpu_count)):
-            logger.warning(
-                "CPU affinity is already constrained for this process. "
-                "Skipping automatic NUMA binding; pass --numa-bind-nodes "
-                "explicitly to override."
-            )
-            return False
-    except (AttributeError, NotImplementedError, psutil.Error):
-        pass
 
     if not _can_set_mempolicy():
         logger.warning(
@@ -323,6 +326,133 @@ def _maybe_get_pct_cpu_binding(numa_nodes: list[int]) -> list[int] | None:
     return sorted(union_cpus)
 
 
+def _parse_cpu_list(value: str) -> set[int]:
+    from vllm.utils.cpu_resource_utils import parse_id_list
+
+    return set(parse_id_list(value))
+
+
+def _node_cpus(node: int) -> set[int]:
+    try:
+        return _parse_cpu_list(
+            Path(f"/sys/devices/system/node/node{node}/cpulist").read_text().strip()
+        )
+    except (OSError, ValueError):
+        return set()
+
+
+def _cpu_sibling_groups(cpus: list[int]) -> list[list[int]] | None:
+    remaining = set(cpus)
+    groups = []
+    while remaining:
+        cpu = min(remaining)
+        try:
+            siblings = _parse_cpu_list(
+                Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
+                .read_text()
+                .strip()
+            )
+        except (OSError, ValueError):
+            return None
+        group = sorted(siblings & set(cpus))
+        if cpu not in group:
+            return None
+        groups.append(group)
+        remaining.difference_update(group)
+    return groups
+
+
+def _policy_cpu_binding(
+    numa_nodes: list[int],
+    policy: NumaPolicy,
+    worker_index: int = 0,
+    allowed_cpus: set[int] | None = None,
+) -> list[int] | None:
+    """Resolve a policy to CPUs; ``None`` means bind to the full node."""
+    if policy == "full_node":
+        return None
+    priority_cpus = _maybe_get_pct_cpu_binding(numa_nodes)
+    if not priority_cpus:
+        return None
+    if policy == "shared_priority":
+        return priority_cpus
+    groups = _cpu_sibling_groups(priority_cpus)
+    if not groups:
+        return priority_cpus
+    if allowed_cpus is not None:
+        groups = [sorted(set(group) & allowed_cpus) for group in groups]
+        groups = [group for group in groups if group]
+    if not groups:
+        return []
+    selected = groups[worker_index % len(groups)]
+    if policy == "split_priority_single_thread":
+        selected = selected[:1]
+    if policy != "hybrid":
+        return selected
+    node_cpus = set().union(*(_node_cpus(node) for node in numa_nodes))
+    ordinary = sorted(node_cpus - set(priority_cpus))
+    if allowed_cpus is not None:
+        ordinary = [cpu for cpu in ordinary if cpu in allowed_cpus]
+    start = worker_index * _HYBRID_ORDINARY_CPUS
+    selected += [
+        ordinary[(start + offset) % len(ordinary)]
+        for offset in range(min(_HYBRID_ORDINARY_CPUS, len(ordinary)))
+    ]
+    return sorted(set(selected))
+
+
+@cache
+def _numa_nodes_by_distance(node: int) -> tuple[int, ...]:
+    root = Path("/sys/devices/system/node")
+    nodes = {node}
+    for path in root.glob("node[0-9]*"):
+        with suppress(ValueError):
+            nodes.add(int(path.name.removeprefix("node")))
+    try:
+        distance_values = (root / f"node{node}/distance").read_text().split()
+        distances = [int(value) for value in distance_values]
+    except (OSError, ValueError):
+        distances = []
+    ordered = tuple(
+        sorted(
+            nodes,
+            key=lambda candidate: (
+                candidate != node,
+                distances[candidate] if candidate < len(distances) else float("inf"),
+                candidate,
+            ),
+        )
+    )
+    logger.info("NUMA fallback order from node %d: %s", node, ordered)
+    return ordered
+
+
+def _numa_fallback_cpu_binding(
+    node: int, allowed_cpus: set[int]
+) -> tuple[int, set[int]] | None:
+    for candidate in _numa_nodes_by_distance(node):
+        target = _node_cpus(candidate) & allowed_cpus
+        if target:
+            return candidate, target
+    return None
+
+
+def _numa_policy(parallel_config, process_kind: str) -> NumaPolicy:
+    value = (
+        getattr(parallel_config, "numa_bind_worker_policy", "shared_priority")
+        if process_kind == "worker"
+        else getattr(parallel_config, "numa_bind_enginecore_policy", "shared_priority")
+    )
+    return cast(NumaPolicy, value)
+
+
+def _worker_index_on_numa_node(parallel_config, gpu_index: int, node: int) -> int:
+    numa_nodes = parallel_config.numa_bind_nodes or get_auto_numa_nodes()
+    if not numa_nodes:
+        return gpu_index
+    return sum(1 for index in range(gpu_index) if numa_nodes[index] == node)
+
+
 def _get_cpu_binding(
     parallel_config, gpu_index: int, numa_nodes: list[int]
 ) -> str | None:
@@ -348,7 +478,46 @@ def _get_numactl_worker_args(
     """Compute the numactl args for a single TP/PP worker subprocess."""
     gpu_index = _get_gpu_index(parallel_config, local_rank, dp_local_rank)
     numa_node = _get_numa_node(parallel_config, gpu_index)
+    policy = _numa_policy(parallel_config, "worker")
+    if policy == "off":
+        return ""
     cpu_binding = _get_cpu_binding(parallel_config, gpu_index, [numa_node])
+    if parallel_config.numa_bind_cpus is None:
+        allowed = os.sched_getaffinity(0)
+        policy_cpus = _policy_cpu_binding(
+            [numa_node],
+            policy,
+            _worker_index_on_numa_node(parallel_config, gpu_index, numa_node),
+            allowed,
+        )
+        if policy_cpus == []:
+            fallback = _numa_fallback_cpu_binding(numa_node, allowed)
+            if fallback is None:
+                logger.warning(
+                    "No allowed CPU is available for NUMA node %d", numa_node
+                )
+                return ""
+            numa_node, target = fallback
+            cpu_binding = ",".join(str(cpu) for cpu in sorted(target))
+        elif policy_cpus is not None:
+            target = set(policy_cpus) & allowed
+            if not target:
+                fallback = _numa_fallback_cpu_binding(numa_node, allowed)
+                if fallback is None:
+                    return ""
+                numa_node, target = fallback
+            cpu_binding = ",".join(str(cpu) for cpu in sorted(target))
+        else:
+            node_cpus = _node_cpus(numa_node)
+            if node_cpus:
+                target = node_cpus & allowed
+                if not target:
+                    fallback = _numa_fallback_cpu_binding(numa_node, allowed)
+                    if fallback is None:
+                        return ""
+                    numa_node, target = fallback
+                if target != node_cpus:
+                    cpu_binding = ",".join(str(cpu) for cpu in sorted(target))
 
     if cpu_binding is not None:
         logger.info(
@@ -420,15 +589,22 @@ def _get_numactl_enginecore_args(
     """
     shard_nodes = _get_enginecore_numa_nodes(parallel_config, dp_local_rank)
     membind_arg = ",".join(str(n) for n in shard_nodes)
+    policy = _numa_policy(parallel_config, "EngineCore")
+    if policy == "off":
+        return ""
 
-    pct_cpus = (
-        None
-        if parallel_config.numa_bind_cpus is not None
-        else _maybe_get_pct_cpu_binding(shard_nodes)
-    )
+    pct_cpus = None
+    if parallel_config.numa_bind_cpus is None:
+        pct_cpus = _policy_cpu_binding(
+            shard_nodes, policy, allowed_cpus=os.sched_getaffinity(0)
+        )
 
     if pct_cpus is not None:
-        cpu_binding = ",".join(str(c) for c in pct_cpus)
+        target = set(pct_cpus) & os.sched_getaffinity(0)
+        if not target:
+            logger.warning("No eligible CPUs for EngineCore NUMA policy %s", policy)
+            return ""
+        cpu_binding = ",".join(str(c) for c in sorted(target))
         logger.info(
             "Binding EngineCore subprocess (local_rank=%s) to CPUs %s "
             "and NUMA nodes %s",
@@ -438,6 +614,14 @@ def _get_numactl_enginecore_args(
         )
         return f"--physcpubind={cpu_binding} --membind={membind_arg}"
 
+    node_cpus = set().union(*(_node_cpus(node) for node in shard_nodes))
+    allowed = os.sched_getaffinity(0)
+    if node_cpus and (target := node_cpus & allowed) != node_cpus:
+        if not target:
+            logger.warning("No allowed CPUs on EngineCore NUMA nodes %s", shard_nodes)
+            return ""
+        cpu_binding = ",".join(str(cpu) for cpu in sorted(target))
+        return f"--physcpubind={cpu_binding} --membind={membind_arg}"
     logger.info(
         "Binding EngineCore subprocess (local_rank=%s) to NUMA nodes %s",
         local_rank,
@@ -530,6 +714,9 @@ def configure_subprocess(
             f"Unknown process_kind {process_kind!r}; expected 'worker' or 'EngineCore'."
         )
 
+    if not numactl_args:
+        yield
+        return
     executable, debug_str = _get_numactl_executable()
     numactl_args = _resolve_numactl_args(numactl_args)
     if not numactl_args:

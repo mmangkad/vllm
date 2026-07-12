@@ -469,6 +469,22 @@ class EngineArgs:
     numa_bind: bool = ParallelConfig.numa_bind
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
+    numa_bind_worker_policy: Literal[
+        "off",
+        "shared_priority",
+        "split_priority_smt",
+        "split_priority_single_thread",
+        "full_node",
+        "hybrid",
+    ] = ParallelConfig.numa_bind_worker_policy
+    numa_bind_enginecore_policy: Literal[
+        "off",
+        "shared_priority",
+        "split_priority_smt",
+        "split_priority_single_thread",
+        "full_node",
+        "hybrid",
+    ] = ParallelConfig.numa_bind_enginecore_policy
     device_ids: list[int | str] | None = None
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
@@ -993,6 +1009,14 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--numa-bind-cpus", **parallel_kwargs["numa_bind_cpus"]
+        )
+        parallel_group.add_argument(
+            "--numa-bind-worker-policy",
+            **parallel_kwargs["numa_bind_worker_policy"],
+        )
+        parallel_group.add_argument(
+            "--numa-bind-enginecore-policy",
+            **parallel_kwargs["numa_bind_enginecore_policy"],
         )
         parallel_group.add_argument(
             "--device-ids",
@@ -2140,6 +2164,8 @@ class EngineArgs:
             numa_bind=self.numa_bind,
             numa_bind_nodes=self.numa_bind_nodes,
             numa_bind_cpus=self.numa_bind_cpus,
+            numa_bind_worker_policy=self.numa_bind_worker_policy,
+            numa_bind_enginecore_policy=self.numa_bind_enginecore_policy,
         )
 
         speculative_config = self.create_speculative_config(

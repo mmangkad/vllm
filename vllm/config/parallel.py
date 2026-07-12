@@ -302,6 +302,24 @@ class ParallelConfig:
     Each entry must use `numactl --physcpubind` CPU-list syntax, for example
     `"0-3"` or `"0,2,4-7"`.
     """
+    numa_bind_worker_policy: Literal[
+        "off",
+        "shared_priority",
+        "split_priority_smt",
+        "split_priority_single_thread",
+        "full_node",
+        "hybrid",
+    ] = "shared_priority"
+    """Automatic CPU-selection policy for GPU worker processes."""
+    numa_bind_enginecore_policy: Literal[
+        "off",
+        "shared_priority",
+        "split_priority_smt",
+        "split_priority_single_thread",
+        "full_node",
+        "hybrid",
+    ] = "shared_priority"
+    """Automatic CPU-selection policy for EngineCore processes."""
     assigned_physical_gpu_ids: list[int] | None = None
     """Mapping from vLLM-local logical GPU IDs to physical GPU IDs.
 
@@ -780,6 +798,8 @@ class ParallelConfig:
             "numa_bind",
             "numa_bind_nodes",
             "numa_bind_cpus",
+            "numa_bind_worker_policy",
+            "numa_bind_enginecore_policy",
             "assigned_physical_gpu_ids",
         }
 

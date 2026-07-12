@@ -161,6 +161,14 @@ GPU-to-NUMA mapping and uses `--cpunodebind=<node> --membind=<node>` for each
 worker. When you need a custom CPU policy, add `--numa-bind-cpus` and vLLM will
 switch to `--physcpubind=<cpu-list> --membind=<node>`.
 
+Automatic CPU selection can be tuned independently with
+`--numa-bind-worker-policy` and `--numa-bind-enginecore-policy`. The supported
+policies are `shared_priority` (the default), `split_priority_smt`,
+`split_priority_single_thread`, `hybrid`, `full_node`, and `off`. Split policies
+assign PCT sibling groups deterministically among workers on a NUMA node;
+`hybrid` also assigns up to four ordinary CPUs. If PCT priority cores cannot be
+detected, the priority policies fall back to full-node binding.
+
 These `--numa-bind*` options only apply to GPU execution processes. They do not
 configure the CPU backend's separate thread-affinity controls. Automatic
 GPU-to-NUMA detection is currently implemented for CUDA/NVML-based as well as
