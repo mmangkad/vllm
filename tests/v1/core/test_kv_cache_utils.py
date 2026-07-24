@@ -2077,15 +2077,13 @@ def test_mixed_precision_kv_cache_with_uniform_type_specs():
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
-                ["fp8_layer"],
+                ["fp8_layer", "bf16_layer"],
                 UniformTypeKVCacheSpecs(
-                    block_size=16, kv_cache_specs={"fp8_layer": fp8_spec}
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["bf16_layer"],
-                UniformTypeKVCacheSpecs(
-                    block_size=16, kv_cache_specs={"bf16_layer": bf16_spec}
+                    block_size=16,
+                    kv_cache_specs={
+                        "fp8_layer": fp8_spec,
+                        "bf16_layer": bf16_spec,
+                    },
                 ),
             ),
         ],

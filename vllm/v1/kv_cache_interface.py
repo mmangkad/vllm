@@ -967,6 +967,8 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    needs_kv_cache_zeroing_from_worker: bool = False
+    """Preserve a worker-side zeroing requirement after scheduler normalization."""
 
     @property
     def has_mamba_layers(self) -> bool:
@@ -997,6 +999,11 @@ class KVCacheConfig:
         Required for Mamba layers, whose state is read before it is fully written
         (#35219), and for mixed-precision caches, where a block reused across
         groups can be reinterpreted under a different precision and decode stale
-        bytes to NaN/Inf. Uniform-precision caches skip zeroing.
+        bytes to NaN/Inf. Scheduler normalization preserves the worker's requirement
+        explicitly. Uniform-precision caches skip zeroing.
         """
-        return self.has_mamba_layers or self.has_mixed_precision_kv_cache
+        return (
+            self.needs_kv_cache_zeroing_from_worker
+            or self.has_mamba_layers
+            or self.has_mixed_precision_kv_cache
+        )
